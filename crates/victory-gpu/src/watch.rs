@@ -113,6 +113,11 @@ struct Saved {
 }
 
 impl Changed {
+    /// Whether `page` is currently armed for GPU-write snapshot saving.
+    fn is_armed(&self, page: usize) -> bool {
+        self.1.lock().unwrap_or_else(|e| e.into_inner()).armed.contains(&page)
+    }
+
     /// Page `page` was taken: what it saved of it is stale.
     fn taken(&self, page: usize) {
         self.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page);
@@ -154,6 +159,11 @@ struct Guards {
     /// with no question to the runtime (whose lock its page mappings hold
     /// for long).
     alias_of: BTreeMap<usize, Vec<usize>>,
+    /// Fault streak per page; after 4 faults the page enters `hot`.
+    faults: BTreeMap<usize, u8>,
+    /// Pages that faulted repeatedly and skip `VirtualProtect` for `n`
+    /// `protect` calls (unless armed) so per-frame buffers avoid fault storms.
+    hot: BTreeMap<usize, u8>,
     /// Tracked pages written this frame and the frame before (diagnostics).
     #[cfg(feature = "diagnostics")]
     written: BTreeSet<usize>,
@@ -166,6 +176,8 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     holders: BTreeMap::new(),
     busy: Vec::new(),
     alias_of: BTreeMap::new(),
+    faults: BTreeMap::new(),
+    hot: BTreeMap::new(),
     #[cfg(feature = "diagnostics")]
     written: BTreeSet::new(),
     #[cfg(feature = "diagnostics")]
@@ -360,6 +372,8 @@ impl Drop for Tracked {
                 holders.retain(|c| !Arc::ptr_eq(c, &self.changed));
                 if holders.is_empty() {
                     g.holders.remove(&page);
+                    g.faults.remove(&page);
+                    g.hot.remove(&page);
                     free.push(page);
                 }
             }
@@ -521,7 +535,31 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
     };
     let mut taken = Vec::with_capacity(pages.len());
     let busy = |page: usize| g.busy.iter().any(|&(a, b)| (a..b).contains(&page));
-    let pages: Vec<usize> = pages.iter().copied().filter(|&p| !busy(p)).collect();
+    let pages: Vec<usize> = pages
+        .iter()
+        .copied()
+        .filter(|&p| {
+            if busy(p) {
+                return false;
+            }
+            if let Some(left) = g.hot.get_mut(&p) {
+                let armed = g
+                    .holders
+                    .get(&p)
+                    .is_some_and(|hs| hs.iter().any(|h| h.is_armed(p)));
+                if armed {
+                    g.hot.remove(&p);
+                    return true;
+                }
+                if *left > 1 {
+                    *left -= 1;
+                    return false;
+                }
+                g.hot.remove(&p);
+            }
+            true
+        })
+        .collect();
     // Only the runtime's GPU memory is guarded. A tracked range can start
     // in free or reserved memory and run on into the host's own pages: in
     // #50 that guarded the process heap's header, and a thread holding the
@@ -755,6 +793,19 @@ fn install() {
         }
         let mut g = guards();
         if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
+            let page = at / PAGE;
+            let armed = g
+                .holders
+                .get(&page)
+                .is_some_and(|hs| hs.iter().any(|h| h.is_armed(page)));
+            if !armed {
+                let n = g.faults.entry(page).or_insert(0);
+                *n = n.saturating_add(1);
+                if *n >= 4 {
+                    g.faults.remove(&page);
+                    g.hot.insert(page, 16);
+                }
+            }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
