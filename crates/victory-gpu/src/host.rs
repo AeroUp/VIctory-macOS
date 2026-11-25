@@ -2653,6 +2653,7 @@ impl Meter {
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let root_views = crate::draw::take_root_view_slots() as f64 / frames;
+        let null_views = crate::draw::take_null_root_views() as f64 / frames;
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
@@ -2663,7 +2664,8 @@ impl Meter {
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
+                 {indirect:.0} indirect; {root_views:.0} root-view slots/frame \
+                 ({null_views:.0} null views bound)",
                 making = crate::pipeline::making()
             );
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();

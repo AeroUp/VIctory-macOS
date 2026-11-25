@@ -115,6 +115,13 @@ pub(crate) fn take_root_view_slots() -> u64 {
 }
 static ROOT_VIEW_SLOTS: AtomicU64 = AtomicU64::new(0);
 
+/// Root views bound as null views (outside the title's buffers,
+/// [`State::root_view`]) since the last call.
+pub(crate) fn take_null_root_views() -> u64 {
+    NULL_ROOT_VIEWS.swap(0, Ordering::Relaxed)
+}
+static NULL_ROOT_VIEWS: AtomicU64 = AtomicU64::new(0);
+
 /// Draws recorded on the host GPU since the last frame line.
 static DRAWN: AtomicU64 = AtomicU64::new(0);
 
@@ -650,14 +657,21 @@ impl State {
                         Some(&(_, offset)) => offset,
                         None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
                             // Where the root address lies in the copy its view shows.
+                            // Outside the title's buffers: a null view
+                            // (`root_view`), at 0.
                             let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
-                                Some(&Root::View(address)) => crate::shadow::find(address, 1)
-                                    .and_then(|s| u32::try_from(s.offset(address)).ok()),
+                                Some(&Root::View(address)) => match crate::shadow::find(address, 1) {
+                                    Some(s) => u32::try_from(s.offset(address)).ok(),
+                                    None => Some(0),
+                                },
                                 _ => None,
                             };
                             match offset {
                                 Some(offset) => offset,
-                                None => return false,
+                                None => {
+                                    not_run("a root view offset past 4 GiB or unset");
+                                    return false;
+                                }
                             }
                         }
                         None if is_root_view(u) => {
@@ -799,25 +813,52 @@ impl State {
     fn root_view(&mut self, list: &HostList, compute: bool, slot: u8, uav: bool) -> Option<(u32, u32)> {
         let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
             once!(slot, "a shader reads a root view the title did not set: dropped");
+            not_run("a root view the title did not set");
             return None;
         };
-        let shadow = crate::shadow::find(address, 1)?;
-        let offset = u32::try_from(shadow.offset(address)).ok()?;
-        shadow.refresh(list, address, shadow.left(address));
-        if uav {
+        // An address in none of the title's buffers (0: a view the title
+        // left unset, which the shader need not read) is a null view, read
+        // as zeros: the console faults only where it is read, and the whole
+        // draw was dropped. Writes through one stay dropped (their marks
+        // would land on whatever the slot named before).
+        let shadow = crate::shadow::find(address, 1);
+        if shadow.is_none() {
+            if uav {
+                not_run("a writable root view outside the title's buffers");
+                return None;
+            }
+            NULL_ROOT_VIEWS.fetch_add(1, Ordering::Relaxed);
+        }
+        let offset = match &shadow {
+            Some(shadow) => match u32::try_from(shadow.offset(address)) {
+                Ok(offset) => offset,
+                Err(_) => {
+                    not_run("a root view offset past 4 GiB");
+                    return None;
+                }
+            },
+            None => 0,
+        };
+        if let Some(shadow) = &shadow {
+            shadow.refresh(list, address, shadow.left(address));
+        }
+        if uav && let Some(shadow) = &shadow {
             // Writes through the view are marked wherever they land in the
             // copy; else declared for 1 MiB.
             let len = if shadow.marked() { shadow.left(address) } else { shadow.left(address).min(1 << 20) };
             shadow.gpu_writes(list, address, len, true);
         }
-        let (key, host) = match self.heaps[0] {
-            0 => (MEMORY_HEAP, crate::memory::heap()?),
-            h => (
-                std::ptr::from_ref(crate::descriptor::heap(h as This)) as usize,
-                crate::descriptor::heap(h as This).host()?,
-            ),
+        let host = match self.heaps[0] {
+            0 => crate::memory::heap().map(|h| (MEMORY_HEAP, h)),
+            h => crate::descriptor::heap(h as This)
+                .host()
+                .map(|host| (std::ptr::from_ref(crate::descriptor::heap(h as This)) as usize, host)),
         };
-        let copy = std::sync::Arc::as_ptr(&shadow) as usize;
+        let Some((key, host)) = host else {
+            not_run("root views without a view heap");
+            return None;
+        };
+        let copy = shadow.as_ref().map_or(0, |s| std::sync::Arc::as_ptr(s) as usize);
         if let Some(&index) = self.root_slots.get(&(key, copy, uav)) {
             return Some((index, offset));
         }
@@ -825,6 +866,7 @@ impl State {
         if run_heap != key || next >= end {
             let Some(first) = host.dynamic(ROOT_VIEW_RUN) else {
                 once!("no dynamic slots for root views: dropped");
+                not_run("no dynamic slots for root views");
                 return None;
             };
             self.dynamic.push((key, first, ROOT_VIEW_RUN));
@@ -833,9 +875,14 @@ impl State {
         let index = self.root_run.1;
         self.root_run.1 += 1;
         ROOT_VIEW_SLOTS.fetch_add(1, Ordering::Relaxed);
-        host.raw_view_at(index, Some(&shadow.buffer), 0, shadow.range().1 & !3, uav);
-        if uav {
-            host.set_mark(index, shadow.mark_entry(shadow.range().0));
+        match &shadow {
+            Some(shadow) => {
+                host.raw_view_at(index, Some(&shadow.buffer), 0, shadow.range().1 & !3, uav);
+                if uav {
+                    host.set_mark(index, shadow.mark_entry(shadow.range().0));
+                }
+            }
+            None => host.raw_view_at(index, None, 0, 0, false),
         }
         self.root_slots.insert((key, copy, uav), index);
         Some((index, offset))
