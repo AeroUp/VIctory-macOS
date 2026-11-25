@@ -25,6 +25,8 @@ mod capture;
 mod composite;
 #[cfg(windows)]
 mod compute;
+#[cfg(windows)]
+mod probe31;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;

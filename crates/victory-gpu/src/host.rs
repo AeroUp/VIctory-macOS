@@ -775,6 +775,7 @@ impl Host {
                 None,
             )?;
             prelude.Close()?;
+            crate::probe31::recording();
             let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
             name(&list, || list_name(id));
             Ok(HostList {
@@ -803,6 +804,7 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        let _alone = crate::probe31::submitting();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -907,6 +909,9 @@ impl Host {
                 match waited {
                     Ok(()) => {
                         WaitForSingleObject(self.event, INFINITE);
+                        if std::env::var("VICTORY_PROBE_31").is_ok_and(|v| v == "2") {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
@@ -1393,7 +1398,9 @@ impl HostList {
             }
         }
         // SAFETY: our list.
-        if let Err(e) = unsafe { self.list.Close() } {
+        let closed = unsafe { self.list.Close() };
+        crate::probe31::recorded();
+        if let Err(e) = closed {
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
@@ -1421,6 +1428,7 @@ impl HostList {
                 .Reset()
                 .and_then(|()| self.list.Reset(&self.allocator, None))
         };
+        crate::probe31::recording();
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
