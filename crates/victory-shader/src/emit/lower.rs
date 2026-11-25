@@ -1407,7 +1407,7 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a vertex input the signature lacks"),
                 };
             }
-            Input::Barycentric { .. } => return Val::Missing("barycentrics read directly"),
+            Input::Barycentric { kind, index } => return self.barycentric_input(kind, index),
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
@@ -1476,6 +1476,46 @@ impl<'a> Lower<'a> {
             }
         };
         self.load_input(id, col)
+    }
+
+    /// Reads `SV_Barycentrics` (DXIL semantic kind 23, float3 `(b0, b1, b2)`).
+    /// RDNA2 passes `(b1, b2)` in `index` 0 and 1.
+    fn barycentric_input(&mut self, kind: Barycentric, index: u8) -> Val {
+        let interp = match kind {
+            Barycentric::LinearCenter | Barycentric::LinearCentroid | Barycentric::LinearSample => {
+                4
+            }
+            Barycentric::PerspectivePullModel => return Val::Missing("barycentrics read directly"),
+            _ => 2,
+        };
+        let id = match self.s.inputs.iter().position(|e| e.kind == 23) {
+            Some(id) => id,
+            None => {
+                let row = self
+                    .s
+                    .inputs
+                    .iter()
+                    .filter_map(|e| e.row)
+                    .map(|r| r + 1)
+                    .max()
+                    .unwrap_or(0);
+                self.s.inputs.push(SigElement {
+                    name: "SV_Barycentrics".into(),
+                    index: 0,
+                    kind: 23,
+                    comp: 9,
+                    interp,
+                    row: Some(row),
+                    col: 0,
+                    cols: 3,
+                    usage: 0,
+                    half: false,
+                });
+                self.s.inputs.len() - 1
+            }
+        };
+        // DXIL SV_Barycentrics has 3 components: (b0, b1, b2); RDNA2 index 0/1 are b1/b2.
+        self.load_input(id, index + 1)
     }
 
     /// A component of a compute thread or group id, read in the entry block.
