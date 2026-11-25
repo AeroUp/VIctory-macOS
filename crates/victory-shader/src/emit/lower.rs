@@ -4733,7 +4733,7 @@ impl<'a> Lower<'a> {
         let views = self.s.view_addresses_handle();
         for k in 0..count {
             let word = (a.offset / 4 + k) % 8;
-            let val = if word < 3 {
+            let val = if word < 4 {
                 let index = self.heap_index(site, k as u8, false)?;
                 let c = self.cur;
                 let four = self.s.m.i32(4);
