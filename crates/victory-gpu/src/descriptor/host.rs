@@ -57,6 +57,13 @@ pub(crate) struct HostHeap {
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
+    /// True once a draw in this heap's lifetime has run a heap-indexing
+    /// shader (`HostShader::heap`). Until then, `!for_draw` view-heap
+    /// writes are deferred into `deferred` so unused bindless slots do not
+    /// eagerly allocate `Shadow` buffers or host textures.
+    heap_indexed: std::sync::atomic::AtomicBool,
+    /// Non-placed view slots deferred while `heap_indexed` is false.
+    deferred: Mutex<std::collections::BTreeSet<u32>>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -215,6 +222,8 @@ impl HostHeap {
             marks,
             addresses: std::sync::OnceLock::new(),
             viewed: Default::default(),
+            heap_indexed: std::sync::atomic::AtomicBool::new(false),
+            deferred: Mutex::default(),
         };
         if !sampler {
             crate::bindless::register(&h.viewed);
@@ -679,21 +688,28 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
+            let placed = is_placed_texture(&view);
+            // Defer placed textures on `!for_draw`, and also defer other view
+            // slots until either a draw binds a table (`for_draw`) or a shader
+            // indexes the heap (`heap_indexed`).
+            let later = !for_draw
+                && (placed
+                    || (!self.sampler
+                        && !self.heap_indexed.load(std::sync::atomic::Ordering::Acquire)));
+            if later {
+                made[index as usize] = 0;
+                if !self.sampler && !placed {
+                    self.deferred
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(index);
+                }
+                return Some(view);
+            }
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
-            // Shaders index the heap itself (`crate::bindless`): buffer views
-            // are made when written.
-            // shortcut: views of textures the title placed itself are made
-            // when a draw reads them through a table: a host texture (and a
-            // staging copy) for each of the ~20,000 the title has views of
-            // ran the host out of memory (run b2).
-            let later = !for_draw && is_placed_texture(&view);
-            made[index as usize] = if later { 0 } else { key };
-            let (kept, mark) = if later {
-                (None, None)
-            } else {
-                make_marked(&view, self.cpu(index))
-            };
+            made[index as usize] = key;
+            let (kept, mark) = make_marked(&view, self.cpu(index));
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
@@ -704,6 +720,25 @@ impl HostHeap {
             self.keep(index, kept.flatten());
         }
         Some(view)
+    }
+
+    /// Materializes every non-placed view slot that was deferred while no draw
+    /// had indexed this heap directly (`HostShader::heap`).
+    pub(crate) fn materialize_heap(&self, start: u64, step: u64) {
+        if self
+            .heap_indexed
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let indices: Vec<u32> = std::mem::take(
+            &mut *self.deferred.lock().unwrap_or_else(|e| e.into_inner()),
+        )
+        .into_iter()
+        .collect();
+        for index in indices {
+            self.mirror(index, start + u64::from(index) * step, false);
+        }
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -1587,5 +1622,45 @@ mod tests {
         let last = first + heap.dynamic - 1;
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    #[test]
+    fn deferred_view_slots_materialize_on_heap_use() {
+        let Some(_) = host() else {
+            return; // no host GPU
+        };
+        let buf = crate::bindless::tests::resource(1, 4096, 1, 0, 1);
+        let (addr, _) = crate::resource::buffer_bytes(buf).unwrap();
+        let addr = addr as u64;
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = std::ptr::null();
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(std::ptr::null(), heap_desc.as_ptr().cast(), &iid, &mut heap),
+            crate::object::S_OK
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let srv: [u32; 10] = [39, 1, 0x1688, 0, 0, 0, 16, 0, 1, 0];
+        crate::descriptor::create_srv(std::ptr::null(), buf, &srv, title_heap.start);
+        let heap_host = title_heap.host().expect("a host view heap");
+
+        let has_shadow = || crate::shadow::all().iter().any(|s| s.range().0 == addr);
+
+        // `!for_draw` defers materialization until a draw indexes the heap.
+        assert!(!heap_host.made(0), "slot should stay deferred before heap use");
+        assert!(!has_shadow(), "shadow copy should not be allocated while deferred");
+
+        // Materializing the heap creates the host view and shadow copy.
+        let step = title_heap.step().unwrap();
+        heap_host.materialize_heap(title_heap.start, step);
+        assert!(heap_host.made(0), "slot should be materialized after heap use");
+        assert!(has_shadow(), "shadow copy should exist after materialization");
+        crate::object::release(buf);
+        crate::object::release(heap);
     }
 }

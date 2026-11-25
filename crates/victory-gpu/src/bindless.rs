@@ -344,7 +344,7 @@ pub(crate) fn log(frames: f64) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::object::{HRESULT, S_OK};
     use windows::Win32::Graphics::Direct3D12::*;
@@ -373,7 +373,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// A title resource from a description in the console's layout (56
     /// bytes: dimension, alignment, width, height, depth and mips, format,
     /// samples, layout, flags).
-    fn resource(dimension: u32, width: u64, height: u32, format: u32, layout: u32) -> This {
+    pub(crate) fn resource(dimension: u32, width: u64, height: u32, format: u32, layout: u32) -> This {
         let desc: [u32; 14] = [
             dimension, 0, 0, 0, width as u32, (width >> 32) as u32, height, 1 | 1 << 16, format, 1, 0,
             layout, 0, 0,
@@ -547,6 +547,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         crate::descriptor::create_uav(null, dst, null, &uav, slot(1));
         crate::descriptor::create_srv(null, tex, std::ptr::null(), slot(2));
         let heap_host = title_heap.host().expect("a host view heap");
+        heap_host.materialize_heap(title_heap.start, title_heap.step().unwrap());
         let (root, pso) = compile();
         let list = host.new_list().unwrap();
         let (dst_bytes, _) = crate::resource::buffer_bytes(dst).unwrap();

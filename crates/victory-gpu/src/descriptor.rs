@@ -109,6 +109,11 @@ impl Heap {
             .as_ref()
     }
 
+    /// The descriptor stride in bytes for this heap kind.
+    pub(crate) fn step(&self) -> Option<u64> {
+        increment(self.desc.kind).map(u64::from)
+    }
+
     /// The descriptor index of `handle` in this heap, if it lies in it.
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
         let step = u64::from(increment(self.desc.kind)?);

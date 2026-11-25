@@ -582,10 +582,13 @@ impl State {
         // to date at submission (`crate::bindless`).
         if p.stages.iter().any(|s| s.translated().host.heap) {
             let writes = p.stages.iter().any(|s| s.translated().host.heap_writes);
-            if let Some(host) = (self.heaps[0] != 0)
-                .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
-                .flatten()
+            if let Some(title_heap) = (self.heaps[0] != 0)
+                .then(|| crate::descriptor::heap(self.heaps[0] as This))
+                && let Some(host) = title_heap.host()
             {
+                if let Some(step) = title_heap.step() {
+                    host.materialize_heap(title_heap.start, step);
+                }
                 list.defer_heap(&host.viewed);
             }
             crate::bindless::note_draw(writes);
@@ -1946,6 +1949,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let uav: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
         crate::descriptor::create_uav(null, dst, null, &uav, title_heap.start + 32);
         let heap_host = title_heap.host().expect("a host view heap");
+        heap_host.materialize_heap(title_heap.start, title_heap.step().unwrap());
         let (root, pso) = compile();
         let list = host.new_list().unwrap();
         let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output's host copy");
