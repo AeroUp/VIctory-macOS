@@ -78,15 +78,26 @@ fn give_back(v: Vec<u8>) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+    let limit = pool_bytes();
     let mut total = 0;
     pool.retain(|v| {
         total += v.capacity();
-        total <= POOL_BYTES
+        total <= limit
     });
 }
 
-/// Snapshot memory kept for reuse.
-const POOL_BYTES: usize = 2 << 30;
+/// Snapshot memory kept for reuse: 2 GiB on Windows, 256 MiB under Rosetta
+/// so unified-memory Macs do not hoard 2 GiB of snapshot buffers in swap.
+fn pool_bytes() -> usize {
+    static LIMIT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if crate::watch::rosetta() {
+            256 << 20
+        } else {
+            2 << 30
+        }
+    });
+    *LIMIT
+}
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
