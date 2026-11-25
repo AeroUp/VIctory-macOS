@@ -2109,10 +2109,44 @@ impl Batch {
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
-        let mut total = 0;
-        for (shadow, from, to) in self.refreshes.drain(..) {
+        let items: Vec<_> = self.refreshes.drain(..).collect();
+        if items.is_empty() {
+            return 0;
+        }
+        // Batch all tracked free refreshes under one guard lock and coalesced
+        // VirtualProtect calls.
+        let mut batch_slots: Vec<Option<usize>> = vec![None; items.len()];
+        let mut reqs: Vec<(&crate::watch::Tracked, usize, usize)> = Vec::new();
+        for (i, (shadow, from, to)) in items.iter().enumerate() {
+            if let Some(target) = shadow.batch_free_target(*from, *to - *from) {
+                batch_slots[i] = Some(reqs.len());
+                reqs.push(target);
+            }
+        }
+        let mut taken: Vec<Vec<(usize, usize)>> = if reqs.len() >= 2 {
+            #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
+            let r = crate::watch::Tracked::take_many(&reqs);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
+            r
+        } else {
+            Vec::new()
+        };
+        let use_batch = !taken.is_empty();
+        let mut total = 0;
+        for (i, (shadow, from, to)) in items.into_iter().enumerate() {
+            let started = std::time::Instant::now();
+            let copied = if use_batch
+                && let Some(slot) = batch_slots[i]
+            {
+                let runs = std::mem::take(&mut taken[slot]);
+                let (s, e) = shadow.range();
+                let (cf, ct) = (from.max(s as usize), to.min((s + e) as usize));
+                shadow.copy_taken_runs(cf, ct, runs)
+            } else {
+                shadow.update(from, to - from)
+            };
             let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
             crate::copystat::range(from, to - from, us, 0);

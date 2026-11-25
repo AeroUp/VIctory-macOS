@@ -582,6 +582,42 @@ impl Shadow {
         copied
     }
 
+    /// Returns the tracker and clamped `[from, to)` when this shadow can take
+    /// part in a batched free refresh (tracked and no pending GPU write
+    /// overlaps `[address, address + len)`).
+    pub(crate) fn batch_free_target(&self, address: usize, len: usize) -> Option<(&crate::watch::Tracked, usize, usize)> {
+        let tracked = self.tracked.as_ref()?;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to {
+            return None;
+        }
+        let has_busy = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|&(a, e)| a < to && e > from);
+        if has_busy {
+            None
+        } else {
+            Some((tracked, from, to))
+        }
+    }
+
+    /// Copies byte runs already taken by [`crate::watch::Tracked::take_many`].
+    pub(crate) fn copy_taken_runs(&self, _from: usize, _to: usize, runs: Vec<(usize, usize)>) -> usize {
+        let copied: usize = runs.into_iter().map(|(a, b)| self.copy(a, b)).sum();
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Watches, 1);
+            add(C::Checked, (_to - _from) as u64);
+            add(C::Unchanged, (_to - _from).saturating_sub(copied) as u64);
+        }
+        copied
+    }
+
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes: the pages changed since taken, or all of it where the
     /// memory is not tracked.

@@ -171,8 +171,6 @@ struct Guards {
     /// Pages that faulted repeatedly and skip `VirtualProtect` for `n`
     /// `protect` calls (unless armed) so per-frame buffers avoid fault storms.
     hot: BTreeMap<usize, u8>,
-    /// Cached runtime-region check across `protect` calls.
-    regions: RuntimeRegions,
     /// Tracked pages written this frame and the frame before (diagnostics).
     #[cfg(feature = "diagnostics")]
     written: BTreeSet<usize>,
@@ -187,7 +185,6 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     alias_of: BTreeMap::new(),
     faults: BTreeMap::new(),
     hot: BTreeMap::new(),
-    regions: RuntimeRegions { last: None },
     #[cfg(feature = "diagnostics")]
     written: BTreeSet::new(),
     #[cfg(feature = "diagnostics")]
@@ -319,7 +316,16 @@ fn aliases(g: &Guards, pages: &[usize]) -> Vec<(usize, usize)> {
 
 /// Guards the other mappings of taken pages.
 fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) {
-    let others: Vec<usize> = pairs.iter().map(|&(_, a)| a).collect();
+    let mut others: Vec<usize> = pairs
+        .iter()
+        .map(|&(_, a)| a)
+        .filter(|p| !g.protected.contains(p))
+        .collect();
+    if others.is_empty() {
+        return;
+    }
+    others.sort_unstable();
+    others.dedup();
     protect(g, &others);
 }
 
@@ -393,24 +399,45 @@ impl Drop for Tracked {
                 }
             }
         }
-        for page in free {
-            open(&mut g, page);
-        }
+        open_many(&mut g, &free);
     }
 }
 
-/// Gives write access back to page `page` if we guarded it.
-fn open(g: &mut Guards, page: usize) -> bool {
+/// Gives write access back to sorted pages `pages` that we guarded, coalescing
+/// consecutive pages into single `VirtualProtect` calls.
+fn open_many(g: &mut Guards, pages: &[usize]) -> usize {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    if !g.protected.remove(&page) {
-        return false;
+    let mut opened = Vec::with_capacity(pages.len());
+    for &page in pages {
+        if g.protected.remove(&page) {
+            opened.push(page);
+        }
     }
-    let mut old = 0;
-    // SAFETY: a block we made read-only (failing harmlessly if it is gone).
-    unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
+    if opened.is_empty() {
+        return 0;
+    }
+    let set = |from: usize, to: usize| {
+        let mut old = 0;
+        // SAFETY: blocks we made read-only (failing harmlessly if gone).
+        unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READWRITE, &mut old) != 0 }
+    };
+    let mut i = 0;
+    while i < opened.len() {
+        let first = i;
+        while i + 1 < opened.len() && opened[i + 1] == opened[i] + 1 {
+            i += 1;
+        }
+        let run = &opened[first..=i];
+        i += 1;
+        if !set(run[0], run[run.len() - 1] + 1) && run.len() > 1 {
+            for &page in run {
+                set(page, page + 1);
+            }
+        }
+    }
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::OpenPages, 1);
-    true
+    crate::copystat::add(crate::copystat::C::OpenPages, opened.len() as u64);
+    opened.len()
 }
 
 impl Tracked {
@@ -490,6 +517,103 @@ impl Tracked {
             }
         }
         runs
+    }
+
+    /// Takes the changed pages of multiple `(tracker, from, to)` requests
+    /// under a single guard-lock acquisition and coalesced `VirtualProtect`
+    /// calls.
+    pub(crate) fn take_many(reqs: &[(&Tracked, usize, usize)]) -> Vec<Vec<(usize, usize)>> {
+        let mut out = vec![Vec::new(); reqs.len()];
+        let mut pending: Vec<(usize, usize, usize, Vec<usize>, Vec<usize>)> = Vec::new();
+        let mut all_whole: Vec<usize> = Vec::new();
+        let frame = FRAME.load(std::sync::atomic::Ordering::Relaxed);
+
+        for (idx, &(t, from, to)) in reqs.iter().enumerate() {
+            if !t.changed.2.load(std::sync::atomic::Ordering::Acquire) {
+                continue;
+            }
+            let (from, to) = (from.max(t.start), to.min(t.end));
+            if from >= to {
+                continue;
+            }
+            let pages: Vec<usize> = {
+                #[cfg(feature = "diagnostics")]
+                let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
+                let changed = t.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+                #[cfg(feature = "diagnostics")]
+                drop(waited);
+                changed.range(from / PAGE..to.div_ceil(PAGE)).copied().collect()
+            };
+            if pages.is_empty() {
+                continue;
+            }
+            let whole: Vec<usize> = if t.changed.3.load(std::sync::atomic::Ordering::Acquire) <= frame {
+                pages
+                    .iter()
+                    .copied()
+                    .filter(|&p| (p * PAGE).max(t.start) >= from && ((p + 1) * PAGE).min(t.end) <= to)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            all_whole.extend_from_slice(&whole);
+            pending.push((idx, from, to, pages, whole));
+        }
+
+        if !all_whole.is_empty() {
+            all_whole.sort_unstable();
+            all_whole.dedup();
+            #[cfg(feature = "diagnostics")]
+            let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
+            let mut g = guards();
+            #[cfg(feature = "diagnostics")]
+            drop(waited);
+            #[cfg(feature = "diagnostics")]
+            let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
+            let others = aliases(&g, &all_whole);
+            guard_aliases(&mut g, &others);
+            #[cfg(feature = "diagnostics")]
+            drop(asked);
+            let mut protected = protect(&mut g, &all_whole);
+            protected.sort_unstable();
+            for &(idx, _, _, _, ref whole) in &pending {
+                if whole.is_empty() {
+                    continue;
+                }
+                let t = reqs[idx].0;
+                let mut changed = t.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+                let mut any = false;
+                for &page in whole {
+                    if protected.binary_search(&page).is_ok() {
+                        changed.remove(&page);
+                        t.changed.taken(page);
+                        any = true;
+                    }
+                }
+                if !any {
+                    t.changed
+                        .3
+                        .store(frame + 4, std::sync::atomic::Ordering::Release);
+                } else if changed.is_empty() {
+                    t.changed
+                        .2
+                        .store(false, std::sync::atomic::Ordering::Release);
+                }
+            }
+            drop(g);
+        }
+
+        for (idx, from, to, pages, _) in pending {
+            let runs = &mut out[idx];
+            for p in pages {
+                let (a, b) = ((p * PAGE).max(from), ((p + 1) * PAGE).min(to));
+                match runs.last_mut() {
+                    Some((_, end)) if *end == a => *end = b,
+                    _ => runs.push((a, b)),
+                }
+            }
+        }
+        out
     }
 
     /// Whether page `page` (a page number) changed since it was taken.
@@ -602,7 +726,8 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
     // #50 that guarded the process heap's header, and a thread holding the
     // heap lock then faulted while another held `Guards` and allocated,
     // a deadlock. Pages left out stay changed, so they are copied whole.
-    let pages: Vec<usize> = pages.into_iter().filter(|&p| g.regions.contains(p)).collect();
+    let mut regions = RuntimeRegions::default();
+    let pages: Vec<usize> = pages.into_iter().filter(|&p| regions.contains(p)).collect();
     let mut i = 0;
     while i < pages.len() {
         if g.protected.contains(&pages[i]) {
@@ -643,6 +768,8 @@ struct RuntimeRegions {
     /// The last region asked about: its pages and whether it is runtime
     /// memory.
     last: Option<(usize, usize, bool)>,
+    /// Sorted non-overlapping cached regions, cleared on remap.
+    regions: Vec<(usize, usize, bool)>,
 }
 
 impl RuntimeRegions {
@@ -652,6 +779,14 @@ impl RuntimeRegions {
             && (a..b).contains(&page)
         {
             return yes;
+        }
+        let idx = self.regions.partition_point(|&(a, _, _)| a <= page);
+        if idx > 0 {
+            let (a, b, yes) = self.regions[idx - 1];
+            if page < b {
+                self.last = Some((a, b, yes));
+                return yes;
+            }
         }
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -666,6 +801,15 @@ impl RuntimeRegions {
         // only shares.
         let (a, b) = (base.div_ceil(PAGE).min(page), ((base + size) / PAGE).max(page + 1));
         self.last = Some((a, b, yes));
+        if self.regions.len() >= 512 {
+            self.regions.clear();
+        }
+        let pos = self.regions.partition_point(|&(ra, _, _)| ra < a);
+        if pos < self.regions.len() && self.regions[pos].0 == a {
+            self.regions[pos] = (a, b, yes);
+        } else {
+            self.regions.insert(pos, (a, b, yes));
+        }
         yes
     }
 }
@@ -676,14 +820,24 @@ impl RuntimeRegions {
 /// guarded.
 fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     let guarded = changed_here(g, first, last, save);
-    let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
+    let mut others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     #[cfg(feature = "diagnostics")]
     {
         let held = others.iter().filter(|p| g.holders.contains_key(p)).count();
         crate::copystat::add(crate::copystat::C::AliasMarks, held as u64);
     }
-    for page in others {
-        changed_here(g, page, page + 1, save);
+    if !others.is_empty() {
+        others.sort_unstable();
+        others.dedup();
+        let mut i = 0;
+        while i < others.len() {
+            let a = others[i];
+            while i + 1 < others.len() && others[i + 1] == others[i] + 1 {
+                i += 1;
+            }
+            changed_here(g, a, others[i] + 1, save);
+            i += 1;
+        }
     }
     guarded
 }
@@ -692,9 +846,7 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
 /// lands: trackers armed for a page they had taken keep its bytes.
 fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
-    for &page in &guarded {
-        open(g, page);
-    }
+    open_many(g, &guarded);
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
             if save {
@@ -815,7 +967,6 @@ pub fn writing(at: usize, len: usize) -> Writing {
 pub fn title_memory_remapped(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
-    g.regions.last = None;
     // What it showed is gone already: nothing to keep.
     changed(&mut g, first, last, false);
     // What it showed is not what it shows now: its links go, both ways.
