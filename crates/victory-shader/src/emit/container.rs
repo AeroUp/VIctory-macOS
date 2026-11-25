@@ -54,6 +54,7 @@ impl SigElement {
         match self.comp {
             1 | 5 => 1, // bool and u32
             4 => 2,
+            8 => 6, // native f16
             9 => 3,
             _ => 0,
         }
@@ -71,7 +72,7 @@ impl SigElement {
 /// signature, packed by the source's modes, had one (an int or a system
 /// value beside a float means the float was `nointerpolation`).
 pub(crate) fn same_mode_per_row(elements: &mut [SigElement], read: bool) {
-    let free = |e: &SigElement| e.kind == 0 && e.comp == 9 && !(read && e.usage != 0);
+    let free = |e: &SigElement| e.kind == 0 && matches!(e.comp, 8 | 9) && !(read && e.usage != 0);
     let mut rows: Vec<u32> = elements.iter().filter_map(|e| e.row).collect();
     rows.sort_unstable();
     rows.dedup();

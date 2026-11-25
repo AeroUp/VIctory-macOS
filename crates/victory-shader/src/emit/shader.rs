@@ -50,6 +50,10 @@ pub const VIEW_WRITES_BYTES: u32 = VIEW_WRITE_BITS / 8 + 4 * ATOMIC_LOCKS;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    /// 16-bit types, native ones (`NATIVE_LOW_PRECISION`) as DXC marks
+    /// them with `-enable-16bit-types`: both bits.
+    pub const LOW_PRECISION: u64 = 1 << 5;
+    pub const NATIVE_LOW_PRECISION: u64 = 1 << 23;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const ROVS: u64 = 1 << 18;
@@ -555,6 +559,12 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        // A signature element declared native 16-bit needs the flags even
+        // where nothing reads or writes it.
+        let elements = self.inputs.iter().chain(&self.outputs).chain(&self.prims);
+        if elements.into_iter().any(|e| e.comp == 8) {
+            self.flags |= flags::LOW_PRECISION | flags::NATIVE_LOW_PRECISION;
+        }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         let mut resources = None;
@@ -906,6 +916,9 @@ impl Shader {
         }
         if self.flags & flags::BARYCENTRICS != 0 {
             features |= 0x2_0000;
+        }
+        if self.flags & flags::NATIVE_LOW_PRECISION != 0 {
+            features |= 0x4_0000;
         }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;

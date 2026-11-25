@@ -376,6 +376,15 @@ pub struct Options {
     /// gradients scaled by `2^bias`, for hosts that ignore the bias of a
     /// compute shader's sample (D3DMetal, #30).
     pub bias_as_gradients: bool,
+    /// The console's 16-bit float parameters (vertex and mesh outputs,
+    /// pixel inputs) are declared native 16-bit (as DXC's
+    /// `-enable-16bit-types` does) instead of 32-bit floats. Apple's mesh
+    /// pipelines take at most 32 KB of vertex data (128 vertices: 64
+    /// floats each); the console's 16-bit parameters, widened, made ~4% of
+    /// Grand Theft Auto VI's mesh pipelines larger, and D3DMetal made them
+    /// no-ops. Every stage of a pipeline must be made with the same
+    /// setting (the signatures' types must match).
+    pub native_half_io: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -443,6 +452,18 @@ pub fn emit_with(
     let pixel = native.stage == HwStage::Ps;
     let mut inputs = sig(FourCC::ISG1)?;
     let mut outputs = sig(FourCC::OSG1)?;
+    if options.native_half_io {
+        let params = match native.stage {
+            HwStage::Ps => Some(&mut inputs),
+            HwStage::Vs | HwStage::Ms => Some(&mut outputs),
+            _ => None,
+        };
+        for e in params.into_iter().flatten() {
+            if e.kind == 0 && e.half && e.comp == 9 {
+                e.comp = 8;
+            }
+        }
+    }
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
@@ -452,7 +473,7 @@ pub fn emit_with(
             // Constant, as DXC declares it (the AMD compiler crashed on a
             // front face without a mode).
             (13, _) => 1,
-            (0 | 6 | 7, 9) => 2,
+            (0 | 6 | 7, 8 | 9) => 2,
             (0, _) => 1,
             _ => 0,
         };
@@ -1582,14 +1603,10 @@ mod tests {
         assert!(!low.contains("dx.op.unary.f32(i32 7"));
     }
 
-    /// A row of 16-bit vertex outputs widens every half before the row's
-    /// first store. Apple's converter writes a row where its first store
-    /// is, so widening between the stores left the later channels read
-    /// before they were made (undefined; Apple's compiler crashed on mesh
-    /// programs with them).
+    /// A one-wave mesh program exporting `exp param0` from a 16-bit output
+    /// row (one half per dword) and the position, made as `options` say.
     #[cfg(windows)]
-    #[test]
-    fn a_half_output_row_is_widened_before_its_stores() {
+    fn half_row_mesh(options: Options) -> Vec<u8> {
         let words = [
             0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
             0x0001_00C1,
@@ -1626,7 +1643,7 @@ mod tests {
             }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
-        let el = |name: &str, kind, row| SigElement {
+        let el = |name: &str, kind, row, half| SigElement {
             name: name.into(),
             index: 0,
             kind,
@@ -1636,29 +1653,163 @@ mod tests {
             col: 0,
             cols: 4,
             usage: 15,
-            half: false,
+            half,
         };
-        let osg1 = container::signature(&[el("SV_Position", 3, 0), el("TEXCOORD", 0, 1)], false);
+        let osg1 = container::signature(
+            &[el("SV_Position", 3, 0, false), el("TEXCOORD", 0, 1, true)],
+            false,
+        );
         let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
         let c = Container::parse(&bytes).unwrap();
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
-        let dxil = emit(&c, &native, &p, &st, &io, &res).unwrap().dxil;
+        emit_with(&c, &native, &p, &st, &io, &res, options).unwrap().dxil
+    }
+
+    /// Lines of `main` in a `dxc -dumpbin` listing that contain `what`.
+    #[cfg(windows)]
+    fn lines_with(body: &str, what: &str) -> Vec<usize> {
+        let lines: Vec<&str> = body.lines().collect();
+        (0..lines.len()).filter(|&i| lines[i].contains(what)).collect()
+    }
+
+    /// dxil.dll's verdict, where there is one (`VICTORY_DXIL`).
+    #[cfg(windows)]
+    fn validated(dxil: &[u8]) {
+        let path = super::validator::Validator::default_path();
+        if let Ok(mut v) = super::validator::Validator::load(path.as_deref()) {
+            v.validate(&mut dxil.to_vec()).unwrap();
+        } else {
+            eprintln!("no dxil.dll; validation skipped");
+        }
+    }
+
+    /// A row of 16-bit vertex outputs widens every half before the row's
+    /// first store. Apple's converter writes a row where its first store
+    /// is, so widening between the stores left the later channels read
+    /// before they were made (undefined; Apple's compiler crashed on mesh
+    /// programs with them).
+    #[cfg(windows)]
+    #[test]
+    fn a_half_output_row_is_widened_before_its_stores() {
+        let Some(text) = dump_dxil(&half_row_mesh(Options::default())) else {
+            eprintln!("no dxc.exe; DXIL check skipped");
+            return;
+        };
+        let body = &text[text.find("define void @main").unwrap()..];
+        let widened = lines_with(body, "call float @dx.op.legacyF16ToF32");
+        let stored = lines_with(body, "call void @dx.op.storeVertexOutput.f32(i32 171, i32 1,");
+        assert_eq!((widened.len(), stored.len()), (4, 4), "{body}");
+        assert!(widened.iter().max() < stored.iter().min(), "{body}");
+    }
+
+    /// With `native_half_io` the 16-bit row is declared `fp16` and stores
+    /// the halves themselves (Apple counts them at two bytes against its
+    /// 32 KB of mesh vertex data), with the module's 16-bit flags.
+    #[cfg(windows)]
+    #[test]
+    fn a_native_half_output_row_stores_halves() {
+        let options = Options {
+            native_half_io: true,
+            ..Options::default()
+        };
+        let dxil = half_row_mesh(options);
+        validated(&dxil);
         let Some(text) = dump_dxil(&dxil) else {
             eprintln!("no dxc.exe; DXIL check skipped");
             return;
         };
         let body = &text[text.find("define void @main").unwrap()..];
-        let lines: Vec<&str> = body.lines().collect();
-        let at = |what: &str| -> Vec<usize> {
-            (0..lines.len()).filter(|&i| lines[i].contains(what)).collect()
+        assert_eq!(
+            lines_with(body, "call void @dx.op.storeVertexOutput.f16(i32 171, i32 1,").len(),
+            4,
+            "{body}"
+        );
+        assert!(lines_with(body, "call float @dx.op.legacyF16ToF32").is_empty(), "{body}");
+        assert!(text.contains("Use native low precision"), "{text}");
+        let sig = &text[text.find("; Output signature").unwrap()..];
+        assert!(sig.lines().any(|l| l.contains("TEXCOORD") && l.contains("fp16")), "{sig}");
+    }
+
+    /// A pixel shader interpolating a 16-bit input declared native 16-bit
+    /// loads the half itself (no 32-bit load narrowed back).
+    #[cfg(windows)]
+    #[test]
+    fn a_native_half_input_loads_the_half() {
+        // p1_f32 v2, v0, attr0.x; p2_f16 v2, attr0, v1, v2; exp mrt0.
+        let p2 = {
+            let vgpr = |n: u32| 256 + n;
+            let w0 = 0x35u32 << 26 | 0x35au32 << 16 | 2;
+            [w0, vgpr(1) << 9 | vgpr(2) << 18]
         };
-        let widened = at("call float @dx.op.legacyF16ToF32");
-        let stored = at("call void @dx.op.storeVertexOutput.f32(i32 171, i32 1,");
-        assert_eq!((widened.len(), stored.len()), (4, 4), "{body}");
-        assert!(widened.iter().max() < stored.iter().min(), "{body}");
+        let words = [
+            0xC808_0000u32, // v_interp_p1_f32 v2, v0, attr0.x
+            p2[0],
+            p2[1], // v_interp_p2_f16 v2, attr0, v1, v2
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            0xBF81_0000,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![crate::native::PsInput {
+                    usage: crate::native::Usage::Generic,
+                    row: 0,
+                    mask: 0b1111,
+                    attr: 0,
+                    flat: false,
+                    fp16: true,
+                    pack2: false,
+                    row2: 0,
+                }],
+                input_addr: 2,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let el = |name: &str, kind, usage, half| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage,
+            half,
+        };
+        let isg1 = container::signature(&[el("TEXCOORD", 0, 0, true)], true);
+        let osg1 = container::signature(&[el("SV_Target", 16, 15, false)], false);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let options = Options {
+            native_half_io: true,
+            ..Options::default()
+        };
+        let dxil = emit_with(&c, &native, &p, &st, &io, &res, options).unwrap().dxil;
+        validated(&dxil);
+        let Some(text) = dump_dxil(&dxil) else {
+            eprintln!("no dxc.exe; DXIL check skipped");
+            return;
+        };
+        let body = &text[text.find("define void @main").unwrap()..];
+        assert_eq!(lines_with(body, "call half @dx.op.loadInput.f16(i32 4, i32 0,").len(), 1, "{body}");
+        assert!(lines_with(body, "@dx.op.loadInput.f32(i32 4, i32 0,").is_empty(), "{body}");
+        let sig = &text[text.find("; Input signature").unwrap()..];
+        assert!(sig.lines().any(|l| l.contains("TEXCOORD") && l.contains("fp16")), "{sig}");
     }
 
     /// A pixel shader reading channel z of an input whose element starts at

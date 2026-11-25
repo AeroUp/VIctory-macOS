@@ -103,6 +103,19 @@ fn bias_as_gradients() -> bool {
     })
 }
 
+/// Whether the console's 16-bit parameters are declared native 16-bit:
+/// under Wine, where Apple's mesh pipelines take at most 32 KB of vertex
+/// data and the widened ones made some larger (`emit::Options`).
+/// `VICTORY_NATIVE_HALF_IO=0` or `1` overrides.
+fn native_half_io() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_NATIVE_HALF_IO").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => under_wine(),
+    })
+}
+
 /// Whether this runs under Wine (on a Mac: D3DMetal's D3D12).
 #[cfg(windows)]
 pub(crate) fn under_wine() -> bool {
@@ -123,10 +136,12 @@ pub(crate) fn under_wine() -> bool {
 }
 
 /// [`build`] for translations with host workarounds (atomic locks, bias
-/// as gradients): their own cache entries, one per combination.
-fn options_build(locks: bool, bias: bool) -> &'static [u8; 32] {
-    static BUILDS: [OnceLock<[u8; 32]>; 4] = [const { OnceLock::new() }; 4];
-    BUILDS[usize::from(locks) | usize::from(bias) << 1].get_or_init(|| {
+/// as gradients, native 16-bit parameters): their own cache entries, one
+/// per combination.
+fn options_build(locks: bool, bias: bool, half: bool) -> &'static [u8; 32] {
+    static BUILDS: [OnceLock<[u8; 32]>; 8] = [const { OnceLock::new() }; 8];
+    let i = usize::from(locks) | usize::from(bias) << 1 | usize::from(half) << 2;
+    BUILDS[i].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
         if locks {
@@ -134,6 +149,9 @@ fn options_build(locks: bool, bias: bool) -> &'static [u8; 32] {
         }
         if bias {
             h.update(b"bias as gradients");
+        }
+        if half {
+            h.update(b"native half io");
         }
         *h.finalize().as_bytes()
     })
@@ -150,11 +168,16 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         view_marks: true,
         atomic_locks: atomic_locks(),
         bias_as_gradients: bias_as_gradients(),
+        native_half_io: native_half_io(),
     };
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
-    let build = if options.atomic_locks || options.bias_as_gradients {
-        options_build(options.atomic_locks, options.bias_as_gradients)
+    let build = if options.atomic_locks || options.bias_as_gradients || options.native_half_io {
+        options_build(
+            options.atomic_locks,
+            options.bias_as_gradients,
+            options.native_half_io,
+        )
     } else {
         build()
     };

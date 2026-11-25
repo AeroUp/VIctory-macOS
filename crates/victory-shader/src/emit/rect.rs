@@ -22,6 +22,11 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
     elements.retain(|e| e.row.is_some());
     for e in &mut elements {
         e.usage = (1 << e.cols) - 1;
+        // A 16-bit float the vertex shader declared native 16-bit
+        // (`Options::native_half_io`): read and written as one here too.
+        if e.half && e.comp == 9 {
+            e.comp = 8;
+        }
     }
     let mut s = Shader::new(false);
     s.gs = Some(6);
@@ -31,10 +36,10 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
     for k in 0..3u32 {
         let mut values = Vec::new();
         for (id, e) in elements.iter().enumerate() {
-            let (ty, suffix) = if e.comp == 9 {
-                (s.t.f32, ".f32")
-            } else {
-                (s.t.i32, ".i32")
+            let (ty, suffix) = match e.comp {
+                9 => (s.t.f32, ".f32"),
+                8 => (s.m.half(), ".f16"),
+                _ => (s.t.i32, ".i32"),
             };
             let mut comps = Vec::new();
             for col in 0..e.cols {
@@ -52,7 +57,7 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
             (0..usize::from(e.cols))
                 .map(|col| {
                     let [v0, v1, v2] = [0, 1, 2].map(|k| corners[k][id][col]);
-                    if e.comp == 9 {
+                    if matches!(e.comp, 8 | 9) {
                         let sum = s.m.bin(b, Bin::Add, v0, v2);
                         s.m.bin(b, Bin::Sub, sum, v1)
                     } else {
@@ -66,7 +71,11 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
     for triangle in [[0, 1, 2], [0, 2, 3]] {
         for k in triangle {
             for (id, e) in elements.iter().enumerate() {
-                let suffix = if e.comp == 9 { ".f32" } else { ".i32" };
+                let suffix = match e.comp {
+                    9 => ".f32",
+                    8 => ".f16",
+                    _ => ".i32",
+                };
                 for col in 0..e.cols {
                     let v = corners[k][id][usize::from(col)];
                     let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), v];

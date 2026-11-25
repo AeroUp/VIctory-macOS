@@ -1548,10 +1548,27 @@ impl<'a> Lower<'a> {
         self.load_any_input(id, col)
     }
 
-    /// An input element's channel as declared (16-bit ones as 32-bit floats).
+    /// An input element's channel as declared: 16-bit ones as 32-bit
+    /// floats, or, declared native 16-bit (`Options::native_half_io`), as
+    /// their bits in the low half.
     fn load_any_input(&mut self, id: usize, col: u8) -> Val {
         let e = &mut self.s.inputs[id];
         e.usage |= 1 << col;
+        if e.comp == 8 {
+            let entry = self.s.entry;
+            let args = [
+                self.s.m.i32(id as u32),
+                self.s.m.i32(0),
+                self.s.m.i8(col),
+                self.s.m.undef(self.s.t.i32),
+            ];
+            let f16 = self.s.m.half();
+            let h = self.s.op(entry, "loadInput.f16", Attr::ReadNone, f16, 4, &args);
+            let i16 = self.s.m.int(16);
+            let bits = self.s.m.cast(entry, Cast::Bitcast, h, i16);
+            self.s.flags |= flags::LOW_PRECISION | flags::NATIVE_LOW_PRECISION;
+            return Val::I32(self.s.m.cast(entry, Cast::ZExt, bits, self.s.t.i32));
+        }
         let (int, bit) = (e.comp != 9, e.comp == 1);
         let ty = if bit {
             self.s.t.i1
@@ -7783,7 +7800,7 @@ impl<'a> Lower<'a> {
             return Err("an interpolation");
         };
         // A channel of an input element, interpolated as `mode` says.
-        let channel = |l: &mut Self, row: u8, ch: u8| -> Result<V, Why> {
+        let channel = |l: &mut Self, row: u8, ch: u8| -> Result<(V, bool), Why> {
             let (id, col) = l
                 .find_input(row, ch)
                 .ok_or("an input the signature lacks")?;
@@ -7792,8 +7809,9 @@ impl<'a> Lower<'a> {
                 return Err("one input interpolated two ways");
             }
             e.interp = mode;
+            let native = e.comp == 8;
             match l.load_any_input(id, col) {
-                Val::I32(x) => Ok(x),
+                Val::I32(x) => Ok((x, native)),
                 _ => Err("an input"),
             }
         };
@@ -7807,7 +7825,17 @@ impl<'a> Lower<'a> {
         let f16 = inst.name().ends_with("_f16");
         let x = match packing {
             None if f16 || attribute.high => return Err("a 16-bit read of a 32-bit input"),
-            None => channel(self, attribute.row, attribute.channel)?,
+            None => match channel(self, attribute.row, attribute.channel)? {
+                (x, false) => x,
+                // A 32-bit read of an element declared native 16-bit.
+                (h, true) => {
+                    let f32t = self.s.t.f32;
+                    let f = self
+                        .s
+                        .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+                    self.as_int(f)
+                }
+            },
             Some(pack2) => {
                 // 16-bit values: one in the low half of each dword, or two
                 // per dword (`packed_half`); the host's are 32-bit floats.
@@ -7820,9 +7848,13 @@ impl<'a> Lower<'a> {
                     let Some((row, ch)) = src else {
                         return Ok(None);
                     };
-                    let x = channel(l, row, ch)?;
-                    let f = l.as_float(x);
-                    Ok(Some(l.narrow16(f)))
+                    match channel(l, row, ch)? {
+                        (h, true) => Ok(Some(h)),
+                        (x, false) => {
+                            let f = l.as_float(x);
+                            Ok(Some(l.narrow16(f)))
+                        }
+                    }
                 };
                 let h = 2 * attribute.channel;
                 let c = self.cur;
@@ -9655,22 +9687,33 @@ impl<'a> Lower<'a> {
         let mut ready = Vec::with_capacity(stores.len());
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
+            let native = elements(self, primitive)[id].comp == 8;
             if let Some(high) = half {
-                // An f16 half, declared a 32-bit float on the host.
                 let c = self.cur;
                 if high {
                     let k16 = self.s.m.i32(16);
                     x = self.s.m.bin(c, Bin::LShr, x, k16);
                 }
-                let f32t = self.s.t.f32;
-                let f = self
-                    .s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
-                x = self.as_int(f);
+                if native {
+                    // Declared native 16-bit: the half itself.
+                    let i16 = self.s.m.int(16);
+                    let bits = self.s.m.cast(c, Cast::Trunc, x, i16);
+                    let f16 = self.s.m.half();
+                    x = self.s.m.cast(c, Cast::Bitcast, bits, f16);
+                    self.s.flags |= flags::LOW_PRECISION | flags::NATIVE_LOW_PRECISION;
+                } else {
+                    // An f16 half, declared a 32-bit float on the host.
+                    let f32t = self.s.t.f32;
+                    let f = self
+                        .s
+                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
+                    x = self.as_int(f);
+                }
             }
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
             let (suffix, x) = match el.comp {
+                8 => (".f16", x),
                 9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
                     let f = match self.floats.get(&value) {
