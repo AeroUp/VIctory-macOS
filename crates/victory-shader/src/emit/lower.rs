@@ -1600,6 +1600,12 @@ impl<'a> Lower<'a> {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
             }
+            Some(&Val::Missing(_)) | None
+                if self.mask_ok && self.lane_bits.contains_key(&v) =>
+            {
+                let bit = self.lane_bits[&v];
+                return self.ballot_bit(v, bit).map(Val::I32);
+            }
             Some(&Val::Missing(w)) => return Err(w),
             Some(&val) => return Ok(val),
             None => {}
@@ -1808,6 +1814,27 @@ impl<'a> Lower<'a> {
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// Ballot of a per-lane bit written into an SGPR that `st.masks` did not track.
+    fn ballot_bit(&mut self, v: Value, bit: V) -> Result<V, Why> {
+        if let Some(&(x, _)) = self.ballots.get(&v) {
+            return Ok(x);
+        }
+        let at = match self.def_block.get(&v) {
+            None => self.s.entry,
+            Some(&b) if b == self.cur_ir => self.cur,
+            Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+        };
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self
+            .s
+            .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+        self.ballots.insert(v, xy);
+        Ok(xy.0)
     }
 
     /// Both dwords of a mask holding lanes that do not reach the block
@@ -10143,7 +10170,51 @@ impl<'a> Lower<'a> {
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
                 let read = live.contains(&(phi.value, n));
-                let x = match (self.vals.get(&arg).copied(), bit) {
+                let live_edge =
+                    read && !self.never_taken(q, b) && !self.dead_on_edge(b, n, phi.reg);
+                let val = match self.vals.get(&arg).copied() {
+                    Some(Val::Missing(_)) | None
+                        if live_edge
+                            && !bit
+                            && self.mask_data == MaskData::Console
+                            && (self.x.st.masks.contains_key(&arg)
+                                || self.x.st.highs.contains_key(&arg)) =>
+                    {
+                        self.mask_dword(arg)
+                            .map(Val::I32)
+                            .unwrap_or_else(Val::Missing)
+                    }
+                    Some(Val::Missing(_)) | None
+                        if live_edge
+                            && !bit
+                            && self.mask_data == MaskData::Console
+                            && self.lane_bits.contains_key(&arg) =>
+                    {
+                        let b = self.lane_bits[&arg];
+                        self.ballot_bit(arg, b)
+                            .map(Val::I32)
+                            .unwrap_or_else(Val::Missing)
+                    }
+                    other => match other {
+                        Some(v) => v,
+                        None => {
+                            if read && (self.never_taken(q, b) || self.dead_on_edge(b, n, phi.reg)) {
+                                if bit {
+                                    Val::Bit(self.s.m.bool(false))
+                                } else {
+                                    Val::I32(self.s.m.i32(0))
+                                }
+                            } else if read {
+                                return Err(Stop::Retry(phi.value, "a join of mismatched values"));
+                            } else if bit {
+                                Val::Bit(self.s.m.bool(false))
+                            } else {
+                                Val::I32(self.s.m.i32(0))
+                            }
+                        }
+                    },
+                };
+                let x = match (Some(val), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     // No lane from this edge reads it, or no lane comes
                     // along it at all: any value will do.

@@ -1066,8 +1066,21 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
     match &reading(this).value {
         Value::Pad(state) if !out.is_null() => {
+            let mut s = *state;
+            static AUTO_A: std::sync::OnceLock<Option<std::time::Instant>> =
+                std::sync::OnceLock::new();
+            if let Some(start) = AUTO_A.get_or_init(|| {
+                std::env::var_os("VICTORY_AUTO_A")
+                    .is_some_and(|v| !v.is_empty() && v != "0")
+                    .then(std::time::Instant::now)
+            }) {
+                let ms = start.elapsed().as_millis();
+                if ms >= 20_000 && (ms % 3_000) < 200 {
+                    s.buttons |= A;
+                }
+            }
             // SAFETY: checked non-null.
-            unsafe { out.write(*state) };
+            unsafe { out.write(s) };
             true
         }
         _ => false,
