@@ -26,4 +26,6 @@ export WINEDEBUG="${WINEDEBUG:--all}"
 export WINEDLLOVERRIDES="mscoree,mshtml=;winedbg.exe=d;d3d12,d3d12core,dxgi=b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
 # Rosetta tells the game about AVX and AVX2, which it may check for.
 export ROSETTA_ADVERTISE_AVX=1
+# Show Apple's Metal Performance HUD (FPS, GPU time, memory) unless overridden.
+export MTL_HUD_ENABLED="${MTL_HUD_ENABLED-1}"
 exec "$WINE" "$ROOT/target/x86_64-pc-windows-gnullvm/release/victory.exe" "$@"
