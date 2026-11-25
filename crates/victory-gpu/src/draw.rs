@@ -2107,6 +2107,20 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// The write shaders' root signature: a table of one unordered view.
     const WRITES: &[Param] = &[Param::Table(&[uav(0, 1)])];
 
+    /// A title texture's host copy is made at its first use, not when the
+    /// title makes the texture (`VICTORY_LAZY_TEXTURES=0`: at creation).
+    #[test]
+    fn a_title_texture_gets_its_host_copy_at_first_use() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let address = title_memory(1 << 20);
+        let texture = texture_at_address(address, &texture_words(64, 64, 28, 0x105, 0));
+        assert_eq!(crate::resource::host_copy_made(texture), !crate::resource::lazy_textures());
+        assert!(crate::resource::host_copy(texture).is_some());
+        assert!(crate::resource::host_copy_made(texture));
+    }
+
     /// One texture memory written through an unordered view of a resource
     /// object in one format and read through a placed view in another: a
     /// castable pair shares one host texture (no copy), a pair of other

@@ -2598,6 +2598,19 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
+                let (copies, host_bytes, summed, covered, written) = crate::resource::texture_cover();
+                tracing::info!(
+                    "title textures with host copies: {copies} copies, {:.0} MB on the host ({:.0} MB GPU-written); \
+                     console bytes {:.0} MB summed, {:.0} MB covered once; staging buffers {:.0} MB, \
+                     copies kept to tell a change {:.0} MB; viewed by host views {:.0} MB",
+                    host_bytes as f64 / 1e6,
+                    written as f64 / 1e6,
+                    summed as f64 / 1e6,
+                    covered as f64 / 1e6,
+                    crate::texture::STAGING_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
+                    crate::texture::LAST_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
+                    crate::resource::VIEWED.load(Ordering::Relaxed) as f64 / 1e6,
+                );
                 let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
                 crate::copystat::log(copy_frames);
                 crate::bindless::log(copy_frames);

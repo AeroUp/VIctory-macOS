@@ -52,6 +52,31 @@ pub(crate) struct Staging {
     last: Mutex<Last>,
 }
 
+/// Bytes of live staging buffers, and of the copies of title memory kept to
+/// tell a change (`Last::read`): the fps line's memory companions.
+pub(crate) static STAGING_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static LAST_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Notes a change of `last`'s capacity from `before` in [`LAST_BYTES`].
+fn note_last(before: usize, last: &Vec<u8>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let after = last.capacity();
+    if after > before {
+        LAST_BYTES.fetch_add((after - before) as u64, Relaxed);
+    } else {
+        LAST_BYTES.fetch_sub((before - after) as u64, Relaxed);
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        STAGING_BYTES.fetch_sub(self.size, Relaxed);
+        let last = self.last.get_mut().unwrap_or_else(|e| e.into_inner());
+        LAST_BYTES.fetch_sub(last.read.capacity() as u64, Relaxed);
+    }
+}
+
 /// What a texture's staging buffer holds: the memory last detiled (memory
 /// not tracked, compared to tell a change), or room to read tracked memory
 /// into.
@@ -308,7 +333,9 @@ impl Staging {
             }
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
+            let before = last.read.capacity();
             last.read.resize(size, 0);
+            note_last(before, &last.read);
             crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
             self.detile(&last.read);
             #[cfg(feature = "diagnostics")]
@@ -333,7 +360,10 @@ impl Staging {
         // tracked: 30-250 ms per frame; the comparison runs at memory speed.
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if !take_changed(&mut last.read, tiled) {
+        let before = last.read.capacity();
+        let changed = take_changed(&mut last.read, tiled);
+        note_last(before, &last.read);
+        if !changed {
             return (size, false);
         }
         self.detile(&last.read);
@@ -480,6 +510,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     let layout_size = layout.size as usize;
+    STAGING_BYTES.fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
         buffer,
         size: total,

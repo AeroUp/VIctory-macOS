@@ -1157,6 +1157,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
             if let Some(copy) = crate::resource::host_copy(resource) {
+                copy.note_viewed();
                 let texture = &copy.texture;
                 let mut desc = desc.as_ref().map(srv_desc);
                 if desc.is_none() && !default_view(resource) {
@@ -1192,6 +1193,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     _ => None,
                 };
             };
+            copy.note_viewed();
             let texture = &copy.texture;
             // A depth texture's unordered views write its twin.
             // SAFETY: a live resource.
