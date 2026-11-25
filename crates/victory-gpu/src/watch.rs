@@ -802,21 +802,11 @@ pub(crate) fn writing_many(ranges: &[(usize, usize)]) -> WritingMany {
 }
 
 pub fn writing(at: usize, len: usize) -> Writing {
-    writing_inner(at, len, true)
-}
-
-/// Like [`writing`], without saving pre-write bytes (used by copy-back,
-/// which already holds the prior snapshot and is about to mark the page taken).
-pub(crate) fn writing_nosave(at: usize, len: usize) -> Writing {
-    writing_inner(at, len, false)
-}
-
-fn writing_inner(at: usize, len: usize, save: bool) -> Writing {
     // The length is the title's (`fread`'s size times count, saturated).
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     g.busy.push((first, last));
-    changed(&mut g, first, last, save);
+    changed(&mut g, first, last, true);
     Writing { first, last }
 }
 

@@ -371,6 +371,7 @@ impl Shadow {
             const PIECE: usize = 64 << 10;
             let mut title = vec![0u8; PIECE];
             let mut synced = Vec::new();
+            let mut pending_writes: Vec<(usize, Vec<u8>)> = Vec::new();
             let mut at = from;
             while at < to {
                 let n = (PIECE - (start + at) % PIECE).min(to - at);
@@ -400,13 +401,20 @@ impl Shadow {
                         *h = *t;
                     }
                     if changed {
-                        let _writing = crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                        pending_writes.push((start + at, title.to_vec()));
                         written += n;
                     }
                     synced.push((start + at) / PAGE);
                 }
                 at += n;
+            }
+            if !pending_writes.is_empty() {
+                let busy: Vec<(usize, usize)> =
+                    pending_writes.iter().map(|(a, b)| (*a, b.len())).collect();
+                let _writing = crate::watch::writing_many(&busy);
+                for (addr, bytes) in pending_writes {
+                    crate::host::write_mapped(addr as *mut u8, bytes.as_ptr(), bytes.len());
+                }
             }
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
