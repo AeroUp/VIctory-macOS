@@ -2065,8 +2065,36 @@ impl Batch {
     /// copies in `current` across `Step::Copy` steps.
     fn title_written_range(&mut self, dst: usize, len: usize) {
         let end = dst.saturating_add(len);
-        if self.refreshes.iter().any(|(_, from, to)| *from < end && dst < *to) {
-            self.flush();
+        if self
+            .refreshes
+            .iter()
+            .any(|(_, from, to)| *from < end && dst < *to)
+        {
+            let mut rest = Vec::new();
+            let mut total = 0;
+            for (shadow, from, to) in self.refreshes.drain(..) {
+                let key = std::sync::Arc::as_ptr(&shadow) as usize;
+                if from < end && dst < to {
+                    self.pending.remove(&key);
+                    let started = std::time::Instant::now();
+                    let copied = shadow.update(from, to - from);
+                    let us = started.elapsed().as_micros() as u64;
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::range(from, to - from, us, 0);
+                    PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                    PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+                    total += copied;
+                } else {
+                    rest.push((shadow, from, to));
+                }
+            }
+            let _ = total;
+            for (i, (shadow, from, to)) in rest.iter().enumerate() {
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                self.pending.insert(key, i);
+                let _ = (from, to);
+            }
+            self.refreshes = rest;
         }
         self.textures.clear();
         self.current.retain(|_, (s, _, _)| {
