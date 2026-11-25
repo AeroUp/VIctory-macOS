@@ -6340,6 +6340,32 @@ impl<'a> Lower<'a> {
                 let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                let (a, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                self.cross_lane(false)?;
+                let me = self.lane_index();
+                let k15 = self.s.m.i32(15);
+                let not15 = self.s.m.i32(!15u32);
+                let mut base = self.s.m.bin(c, Bin::And, me, not15);
+                if name == "v_permlanex16_b32" {
+                    let k16 = self.s.m.i32(16);
+                    base = self.s.m.bin(c, Bin::Xor, base, k16);
+                }
+                let k8 = self.s.m.i32(8);
+                let k0 = self.s.m.i32(0);
+                let hi = self.s.m.bin(c, Bin::And, me, k8);
+                let is_hi = self.s.m.cmp(c, pred::NE, hi, k0);
+                let sel = self.s.m.select(c, is_hi, s2, s1);
+                let k7 = self.s.m.i32(7);
+                let k2 = self.s.m.i32(2);
+                let nibble = self.s.m.bin(c, Bin::And, me, k7);
+                let shift = self.s.m.bin(c, Bin::Shl, nibble, k2);
+                let shifted = self.s.m.bin(c, Bin::LShr, sel, shift);
+                let pick = self.s.m.bin(c, Bin::And, shifted, k15);
+                let lane = self.s.m.bin(c, Bin::Or, base, pick);
+                let r = self.read_lane(a, lane);
+                int(self, r)
+            }
             _ => {
                 let r = self.integer(inst, name)?;
                 int(self, r)
@@ -8100,10 +8126,8 @@ impl<'a> Lower<'a> {
             if name != "image_store" {
                 return Err("an image store to a mip level");
             }
-            // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            if *dmask != 0xF {
-                return Err("an image store of some channels");
+            if *dmask == 0 {
+                return Ok(());
             }
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
@@ -8113,8 +8137,14 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image store data");
             };
-            let mut vals = Vec::new();
-            for k in 0..4u8 {
+            let fu = self.s.m.undef(self.s.t.f32);
+            let mut vals = Vec::with_capacity(4);
+            let mut k = 0u8;
+            for ch in 0..4u8 {
+                if (*dmask >> ch) & 1 == 0 {
+                    vals.push(fu);
+                    continue;
+                }
                 // d16: two f16 channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
@@ -8130,13 +8160,14 @@ impl<'a> Lower<'a> {
                 } else {
                     self.float_of(v)?
                 });
+                k += 1;
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
             let mut args = vec![h];
             args.extend(cs);
             args.extend(vals);
-            args.push(self.s.m.i8(0xF));
+            args.push(self.s.m.i8(*dmask));
             let void = self.s.t.void;
             self.s.op(
                 self.cur,
