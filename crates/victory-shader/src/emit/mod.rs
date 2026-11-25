@@ -1470,7 +1470,11 @@ mod tests {
         if !dxc.exists() {
             return None;
         }
-        let file = std::env::temp_dir().join(format!("victory-interp-{}.dxil", std::process::id()));
+        // One file per call: tests run it in parallel.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let file =
+            std::env::temp_dir().join(format!("victory-interp-{}-{n}.dxil", std::process::id()));
         std::fs::write(&file, container).ok()?;
         let out = std::process::Command::new(dxc)
             .arg("-dumpbin")
@@ -1576,6 +1580,85 @@ mod tests {
             "clamp saturates the result"
         );
         assert!(!low.contains("dx.op.unary.f32(i32 7"));
+    }
+
+    /// A row of 16-bit vertex outputs widens every half before the row's
+    /// first store. Apple's converter writes a row where its first store
+    /// is, so widening between the stores left the later channels read
+    /// before they were made (undefined; Apple's compiler crashed on mesh
+    /// programs with them).
+    #[cfg(windows)]
+    #[test]
+    fn a_half_output_row_is_widened_before_its_stores() {
+        let words = [
+            0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x0001_00C1,
+            0x7E12_02FF, // v_mov_b32 v9, prim
+            TRIANGLE,
+            0xF800_0941, // exp prim v9, off, off, off done
+            0x0000_0009,
+            0xF800_020F, // exp param0 v1, v1, v1, v1
+            0x0101_0101,
+            0xF800_08CF, // exp pos0 v1, v1, v1, v1 done
+            0x0101_0101,
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 10,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![crate::native::VsOutput {
+                    usage: crate::native::Usage::Generic,
+                    row: 1,
+                    param: 0,
+                    fp16: true,
+                    pack2: false,
+                }],
+                clip_cntl: 0,
+                threads: 32,
+                max_vertices: 32,
+                max_primitives: 32,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let el = |name: &str, kind, row| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let osg1 = container::signature(&[el("SV_Position", 3, 0), el("TEXCOORD", 0, 1)], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let dxil = emit(&c, &native, &p, &st, &io, &res).unwrap().dxil;
+        let Some(text) = dump_dxil(&dxil) else {
+            eprintln!("no dxc.exe; DXIL check skipped");
+            return;
+        };
+        let body = &text[text.find("define void @main").unwrap()..];
+        let lines: Vec<&str> = body.lines().collect();
+        let at = |what: &str| -> Vec<usize> {
+            (0..lines.len()).filter(|&i| lines[i].contains(what)).collect()
+        };
+        let widened = at("call float @dx.op.legacyF16ToF32");
+        let stored = at("call void @dx.op.storeVertexOutput.f32(i32 171, i32 1,");
+        assert_eq!((widened.len(), stored.len()), (4, 4), "{body}");
+        assert!(widened.iter().max() < stored.iter().min(), "{body}");
     }
 
     /// A pixel shader reading channel z of an input whose element starts at

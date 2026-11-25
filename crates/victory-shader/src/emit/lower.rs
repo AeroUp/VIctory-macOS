@@ -9647,6 +9647,12 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        // Every value first, then the stores: Apple's converter makes one
+        // write of a row's stores where the first of them is, so a value
+        // made between two of them (a half's widening) would be read
+        // before it is made (undefined, and Apple's compiler crashed on
+        // the mesh programs with it).
+        let mut ready = Vec::with_capacity(stores.len());
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
@@ -9675,6 +9681,9 @@ impl<'a> Lower<'a> {
                 }
                 _ => (".i32", x),
             };
+            ready.push((id, col, suffix, x));
+        }
+        for (id, col, suffix, x) in ready {
             let mut args = vec![
                 self.s.m.i32(id as u32),
                 self.s.m.i32(0),
