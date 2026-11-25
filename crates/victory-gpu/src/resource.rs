@@ -888,6 +888,7 @@ impl HostTexture {
         });
         TEXTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        HOST_TEXTURES_CREATED.fetch_add(1, std::sync::atomic::Ordering::Release);
         HostTexture {
             texture,
             state: state.into(),
@@ -931,6 +932,25 @@ static USED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0)
 /// Host textures alive and the bytes they take (the fps line's companion).
 #[cfg(windows)]
 static TEXTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+static HOST_TEXTURES_CREATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+pub(crate) fn host_texture_epoch() -> u64 {
+    HOST_TEXTURES_CREATED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether `this` is a GPU-written texture (`ALLOW_RENDER_TARGET |
+/// ALLOW_DEPTH_STENCIL | ALLOW_UNORDERED_ACCESS`) whose `HostTexture` has not
+/// been allocated yet.
+#[cfg(windows)]
+pub(crate) fn is_gpu_written_unmade(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let r = resource(this);
+    r.desc.dimension != BUFFER && (r.desc.flags & USES) != 0 && r.host.get().is_none()
+}
 #[cfg(windows)]
 static TEXTURE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Title textures that found their memory's host texture made already.

@@ -203,6 +203,11 @@ impl Shadow {
         n
     }
 
+    /// Whether this copy has any tracked dirty pages (always `true` when untracked).
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.tracked.as_ref().is_none_or(|t| t.is_dirty())
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {

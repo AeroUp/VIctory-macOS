@@ -62,8 +62,11 @@ pub(crate) struct HostHeap {
     /// writes are deferred into `deferred` so unused bindless slots do not
     /// eagerly allocate `Shadow` buffers or host textures.
     heap_indexed: std::sync::atomic::AtomicBool,
-    /// Non-placed view slots deferred while `heap_indexed` is false.
+    /// Non-placed view slots deferred while `heap_indexed` is false, or
+    /// GPU-written texture views deferred until a command list creates them.
     deferred: Mutex<std::collections::BTreeSet<u32>>,
+    /// Epoch of `crate::resource::host_texture_epoch()` last checked.
+    gpu_epoch: std::sync::atomic::AtomicU64,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -224,6 +227,7 @@ impl HostHeap {
             viewed: Default::default(),
             heap_indexed: std::sync::atomic::AtomicBool::new(false),
             deferred: Mutex::default(),
+            gpu_epoch: std::sync::atomic::AtomicU64::new(0),
         };
         if !sampler {
             crate::bindless::register(&h.viewed);
@@ -692,12 +696,23 @@ impl HostHeap {
             // Defer placed textures on `!for_draw`, and also defer other view
             // slots until either a draw binds a table (`for_draw`) or a shader
             // indexes the heap (`heap_indexed`).
+            let gpu_tex_unmade = !for_draw
+                && match &view {
+                    View::Shader(res, _) | View::Unordered(res, _, _) => {
+                        crate::resource::is_gpu_written_unmade(*res as crate::object::This)
+                    }
+                    _ => false,
+                };
             let later = !for_draw
                 && (placed
+                    || gpu_tex_unmade
                     || (!self.sampler
                         && !self.heap_indexed.load(std::sync::atomic::Ordering::Acquire)));
             if later {
                 made[index as usize] = 0;
+                if gpu_tex_unmade {
+                    null_for(&view, self.cpu(index));
+                }
                 if !self.sampler && !placed {
                     self.deferred
                         .lock()
@@ -729,6 +744,27 @@ impl HostHeap {
             .heap_indexed
             .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
+            return;
+        }
+        let indices: Vec<u32> = std::mem::take(
+            &mut *self.deferred.lock().unwrap_or_else(|e| e.into_inner()),
+        )
+        .into_iter()
+        .collect();
+        for index in indices {
+            self.mirror(index, start + u64::from(index) * step, false);
+        }
+        self.gpu_epoch.store(
+            crate::resource::host_texture_epoch(),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    /// Re-mirrors deferred GPU-written texture slots whose `HostTexture` has
+    /// now been created by a command list.
+    pub(crate) fn refresh_gpu_textures(&self, start: u64, step: u64) {
+        let now = crate::resource::host_texture_epoch();
+        if self.gpu_epoch.swap(now, std::sync::atomic::Ordering::AcqRel) == now {
             return;
         }
         let indices: Vec<u32> = std::mem::take(

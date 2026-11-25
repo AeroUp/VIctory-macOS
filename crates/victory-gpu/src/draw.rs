@@ -588,6 +588,7 @@ impl State {
             {
                 if let Some(step) = title_heap.step() {
                     host.materialize_heap(title_heap.start, step);
+                    host.refresh_gpu_textures(title_heap.start, step);
                 }
                 list.defer_heap(&host.viewed);
             }

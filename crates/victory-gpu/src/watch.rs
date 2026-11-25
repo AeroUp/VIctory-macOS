@@ -414,6 +414,10 @@ fn open(g: &mut Guards, page: usize) -> bool {
 }
 
 impl Tracked {
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.changed.2.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Takes the changed pages of `[from, to)`: guards them (writes from
     /// now on mark them again) and returns the byte ranges to copy, cut to
     /// `[from, to)`, in order. A page whose part in the tracked memory lies
@@ -693,7 +697,9 @@ fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     }
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
-            c.3.store(0, std::sync::atomic::Ordering::Release);
+            if save {
+                c.3.store(0, std::sync::atomic::Ordering::Release);
+            }
             let first_write = c.0.lock().unwrap_or_else(|e| e.into_inner()).insert(page);
             if first_write {
                 c.2.store(true, std::sync::atomic::Ordering::Release);
