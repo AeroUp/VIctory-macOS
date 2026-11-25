@@ -189,6 +189,7 @@ struct Lower<'a> {
     cur: usize,
     bools: HashMap<(usize, Bool), V>,
     lane_bits: HashMap<Value, V>,
+    lane_highs: HashMap<Value, Value>,
     /// IR phi location by value.
     phi_at: HashMap<Value, (usize, usize)>,
     mask_phis: HashMap<Value, V>,
@@ -594,6 +595,7 @@ impl<'a> Lower<'a> {
             cur: 0,
             bools: HashMap::new(),
             lane_bits: HashMap::new(),
+            lane_highs: HashMap::new(),
             phi_at,
             mask_phis: HashMap::new(),
             pending_masks: Vec::new(),
@@ -1604,7 +1606,14 @@ impl<'a> Lower<'a> {
                 if self.mask_ok && self.lane_bits.contains_key(&v) =>
             {
                 let bit = self.lane_bits[&v];
-                return self.ballot_bit(v, bit).map(Val::I32);
+                return self.ballot_bit(v, bit, false).map(Val::I32);
+            }
+            Some(&Val::Missing(_)) | None
+                if self.mask_ok && self.lane_highs.contains_key(&v) =>
+            {
+                let lo = self.lane_highs[&v];
+                let bit = self.lane_bits[&lo];
+                return self.ballot_bit(lo, bit, true).map(Val::I32);
             }
             Some(&Val::Missing(w)) => return Err(w),
             Some(&val) => return Ok(val),
@@ -1817,24 +1826,27 @@ impl<'a> Lower<'a> {
     }
 
     /// Ballot of a per-lane bit written into an SGPR that `st.masks` did not track.
-    fn ballot_bit(&mut self, v: Value, bit: V) -> Result<V, Why> {
-        if let Some(&(x, _)) = self.ballots.get(&v) {
-            return Ok(x);
-        }
-        let at = match self.def_block.get(&v) {
-            None => self.s.entry,
-            Some(&b) if b == self.cur_ir => self.cur,
-            Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+    fn ballot_bit(&mut self, lo: Value, bit: V, high: bool) -> Result<V, Why> {
+        let (x, y) = match self.ballots.get(&lo) {
+            Some(&xy) => xy,
+            None => {
+                let at = match self.def_block.get(&lo) {
+                    None => self.s.entry,
+                    Some(&b) if b == self.cur_ir => self.cur,
+                    Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+                };
+                let i32t = self.s.t.i32;
+                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                let r = self
+                    .s
+                    .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+                self.s.flags |= flags::WAVE_OPS;
+                let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                self.ballots.insert(lo, xy);
+                xy
+            }
         };
-        let i32t = self.s.t.i32;
-        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-        let r = self
-            .s
-            .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
-        self.s.flags |= flags::WAVE_OPS;
-        let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
-        self.ballots.insert(v, xy);
-        Ok(xy.0)
+        Ok(if high { y } else { x })
     }
 
     /// Both dwords of a mask holding lanes that do not reach the block
@@ -5700,6 +5712,11 @@ impl<'a> Lower<'a> {
                 {
                     let carry = self.s.m.cmp(c, pred::IULT, r, addend);
                     self.lane_bits.insert(w, carry);
+                    if self.x.native.wave64
+                        && let Some(hi) = inst.write(Reg::S(code + 1))
+                    {
+                        self.lane_highs.insert(hi, w);
+                    }
                 }
                 for &(_, w) in &inst.writes {
                     self.vals
@@ -6286,6 +6303,11 @@ impl<'a> Lower<'a> {
                     && let Some(w) = inst.write(Reg::S(code))
                 {
                     self.lane_bits.insert(w, carry);
+                    if self.x.native.wave64
+                        && let Some(hi) = inst.write(Reg::S(code + 1))
+                    {
+                        self.lane_highs.insert(hi, w);
+                    }
                 }
                 for &(_, w) in &inst.writes {
                     self.vals
@@ -7678,8 +7700,15 @@ impl<'a> Lower<'a> {
                 _ => None,
             }
         };
-        if let Some(lo) = code.and_then(|c| inst.write(Reg::S(c))) {
+        if let Some(c) = code
+            && let Some(lo) = inst.write(Reg::S(c))
+        {
             self.lane_bits.insert(lo, r);
+            if self.x.native.wave64
+                && let Some(hi) = inst.write(Reg::S(c + 1))
+            {
+                self.lane_highs.insert(hi, lo);
+            }
         }
         for &(_, w) in &inst.writes {
             self.vals
@@ -10191,7 +10220,19 @@ impl<'a> Lower<'a> {
                             && self.lane_bits.contains_key(&arg) =>
                     {
                         let b = self.lane_bits[&arg];
-                        self.ballot_bit(arg, b)
+                        self.ballot_bit(arg, b, false)
+                            .map(Val::I32)
+                            .unwrap_or_else(Val::Missing)
+                    }
+                    Some(Val::Missing(_)) | None
+                        if live_edge
+                            && !bit
+                            && self.mask_data == MaskData::Console
+                            && self.lane_highs.contains_key(&arg) =>
+                    {
+                        let lo = self.lane_highs[&arg];
+                        let b = self.lane_bits[&lo];
+                        self.ballot_bit(lo, b, true)
                             .map(Val::I32)
                             .unwrap_or_else(Val::Missing)
                     }
@@ -10253,11 +10294,27 @@ impl<'a> Lower<'a> {
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let m =
-                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
-                let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
+                let arg = phi.args[n];
+                let x = if let Some(&m) = self.x.st.masks.get(&arg) {
+                    self.boolean(m, qb).map_err(|w| unsupported(offset, w))?
+                } else if self.never_taken(q, b) || self.dead_on_edge(b, n, phi.reg) {
+                    self.s.m.bool(false)
+                } else if let Some(&bit) = self.lane_bits.get(&arg) {
+                    bit
+                } else if self.console_lanes
+                    && let Ok(Val::I32(lo)) = self.get(arg)
+                {
+                    let hi = match self.pair_high(arg).map(|h| self.get(h)) {
+                        Some(Ok(Val::I32(h))) => Some(h),
+                        Some(_) => {
+                            return Err(unsupported(offset, "a lane-mask join of an untracked mask"));
+                        }
+                        None => None,
+                    };
+                    self.lane_bit(qb, lo, hi)
+                } else {
+                    return Err(unsupported(offset, "a lane-mask join of an untracked mask"));
+                };
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);
