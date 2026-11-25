@@ -726,11 +726,21 @@ impl Drop for Writing {
 /// `kernel_will_write`) around the title's kernel reads into its own
 /// memory and DirectStorage's writes to addresses.
 pub fn writing(at: usize, len: usize) -> Writing {
+    writing_inner(at, len, true)
+}
+
+/// Like [`writing`], without saving pre-write bytes (used by copy-back,
+/// which already holds the prior snapshot and is about to mark the page taken).
+pub(crate) fn writing_nosave(at: usize, len: usize) -> Writing {
+    writing_inner(at, len, false)
+}
+
+fn writing_inner(at: usize, len: usize, save: bool) -> Writing {
     // The length is the title's (`fread`'s size times count, saturated).
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     g.busy.push((first, last));
-    changed(&mut g, first, last, true);
+    changed(&mut g, first, last, save);
     Writing { first, last }
 }
 
@@ -819,7 +829,7 @@ fn install() {
                 *n = n.saturating_add(1);
                 if *n >= 4 {
                     g.faults.remove(&page);
-                    g.hot.insert(page, 128);
+                    g.hot.insert(page, 255);
                 }
             }
             #[cfg(feature = "diagnostics")]

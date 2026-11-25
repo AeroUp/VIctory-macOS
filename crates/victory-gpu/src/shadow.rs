@@ -481,7 +481,7 @@ impl Shadow {
             }
         };
         if let Some(bytes) = written {
-            let _writing = crate::watch::writing(from, n);
+            let _writing = crate::watch::writing_nosave(from, n);
             crate::host::write_mapped(from as *mut u8, bytes, n);
         }
         // Equal to title memory now: taken, unless it holds the page in part.
