@@ -803,7 +803,7 @@ fn install() {
                 *n = n.saturating_add(1);
                 if *n >= 4 {
                     g.faults.remove(&page);
-                    g.hot.insert(page, 16);
+                    g.hot.insert(page, 128);
                 }
             }
             #[cfg(feature = "diagnostics")]
