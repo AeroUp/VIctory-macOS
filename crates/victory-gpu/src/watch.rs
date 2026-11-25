@@ -100,7 +100,14 @@ pub(crate) const PAGE: usize = 64 << 10;
 
 /// The pages a tracker has not taken since they changed, and what it saves
 /// of pages it armed.
-struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>, std::sync::atomic::AtomicBool);
+struct Changed(
+    Mutex<BTreeSet<usize>>,
+    Mutex<Saved>,
+    std::sync::atomic::AtomicBool,
+    std::sync::atomic::AtomicU64,
+);
+
+static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Pages (page numbers) whose bytes a tracker keeps when they are first
 /// written after it took them, and those bytes: while shaders may be
@@ -333,6 +340,7 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
         Mutex::new(pages.clone().collect()),
         Mutex::default(),
         std::sync::atomic::AtomicBool::new(!pages.is_empty()),
+        std::sync::atomic::AtomicU64::new(0),
     ));
     let mut g = guards();
     for page in pages {
@@ -434,29 +442,41 @@ impl Tracked {
             .copied()
             .filter(|&p| (p * PAGE).max(self.start) >= from && ((p + 1) * PAGE).min(self.end) <= to)
             .collect();
-        // Every address showing the same pages is guarded too. A write in
-        // between marks them changed again; the copy, made after, has it.
-        #[cfg(feature = "diagnostics")]
-        let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
-        let mut g = guards();
-        let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
-        #[cfg(feature = "diagnostics")]
-        drop(waited);
-        #[cfg(feature = "diagnostics")]
-        let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
-        let others = aliases(&g, &whole);
-        guard_aliases(&mut g, &others);
-        #[cfg(feature = "diagnostics")]
-        drop(asked);
-        for page in protect(&mut g, &whole) {
-            changed.remove(&page);
-            self.changed.taken(page);
+        let frame = FRAME.load(std::sync::atomic::Ordering::Relaxed);
+        if !whole.is_empty() && self.changed.3.load(std::sync::atomic::Ordering::Acquire) <= frame {
+            // Every address showing the same pages is guarded too. A write in
+            // between marks them changed again; the copy, made after, has it.
+            #[cfg(feature = "diagnostics")]
+            let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
+            let mut g = guards();
+            let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+            #[cfg(feature = "diagnostics")]
+            drop(waited);
+            #[cfg(feature = "diagnostics")]
+            let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
+            let others = aliases(&g, &whole);
+            guard_aliases(&mut g, &others);
+            #[cfg(feature = "diagnostics")]
+            drop(asked);
+            let protected = protect(&mut g, &whole);
+            if protected.is_empty() {
+                self.changed
+                    .3
+                    .store(frame + 4, std::sync::atomic::Ordering::Release);
+            } else {
+                for page in protected {
+                    changed.remove(&page);
+                    self.changed.taken(page);
+                }
+                if changed.is_empty() {
+                    self.changed
+                        .2
+                        .store(false, std::sync::atomic::Ordering::Release);
+                }
+            }
+            drop(changed);
+            drop(g);
         }
-        if changed.is_empty() {
-            self.changed.2.store(false, std::sync::atomic::Ordering::Release);
-        }
-        drop(changed);
-        drop(g);
         let mut runs: Vec<(usize, usize)> = Vec::new();
         for p in pages {
             let (a, b) = ((p * PAGE).max(from), ((p + 1) * PAGE).min(to));
@@ -673,6 +693,7 @@ fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     }
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
+            c.3.store(0, std::sync::atomic::Ordering::Release);
             let first_write = c.0.lock().unwrap_or_else(|e| e.into_inner()).insert(page);
             if first_write {
                 c.2.store(true, std::sync::atomic::Ordering::Release);
@@ -687,16 +708,19 @@ fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     !guarded.is_empty()
 }
 
-/// At each presented frame (diagnostics): counts the tracked pages written
-/// in it, and those written the frame before too.
-#[cfg(feature = "diagnostics")]
+/// At each presented frame: advances the frame counter and (with diagnostics)
+/// counts the tracked pages written in it and the frame before.
 pub(crate) fn frame_done() {
-    let mut g = guards();
-    let written = std::mem::take(&mut g.written);
-    let again = written.intersection(&g.written_before).count();
-    crate::copystat::add(crate::copystat::C::WrittenPages, written.len() as u64);
-    crate::copystat::add(crate::copystat::C::WrittenAgain, again as u64);
-    g.written_before = written;
+    FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    {
+        let mut g = guards();
+        let written = std::mem::take(&mut g.written);
+        let again = written.intersection(&g.written_before).count();
+        crate::copystat::add(crate::copystat::C::WrittenPages, written.len() as u64);
+        crate::copystat::add(crate::copystat::C::WrittenAgain, again as u64);
+        g.written_before = written;
+    }
 }
 
 /// A write into title memory the guards do not see, under way: its pages
