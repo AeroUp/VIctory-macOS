@@ -331,7 +331,12 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     // The pre-build's key listing (diagnostics) translates nothing.
-    if pipelines && std::env::var_os("VICTORY_PREBUILD_KEYS").is_some() {
+    // So does a pre-build of chosen pipelines (`VICTORY_PREBUILD_ONLY`),
+    // whose shaders are translated as they are made.
+    if pipelines
+        && (std::env::var_os("VICTORY_PREBUILD_KEYS").is_some()
+            || std::env::var_os("VICTORY_PREBUILD_ONLY").is_some())
+    {
         return crate::prebuild::run(&paths, threads);
     }
     let started = std::time::Instant::now();

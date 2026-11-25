@@ -172,6 +172,58 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     };
     let mut jobs: Vec<Job> = (0..compute.len()).map(Job::Compute).collect();
     jobs.extend((0..graphics.len()).map(Job::Graphics));
+    // Diagnostics, `VICTORY_PREBUILD_ONLY=mesh` or a comma list of 16-digit
+    // shader hashes: make only the mesh pipelines, or only the pipelines
+    // with one of those shaders, and print a line before and after each
+    // (to find which pipelines the host compiler fails on).
+    let only: Option<Vec<String>> = std::env::var("VICTORY_PREBUILD_ONLY").ok().map(|v| {
+        v.split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .collect()
+    });
+    if let Some(only) = &only {
+        jobs.retain(|&job| {
+            let names = shaders_of(job);
+            only.iter().any(|o| match o.as_str() {
+                "mesh" => names.contains("mesh "),
+                h => names.contains(h),
+            })
+        });
+        println!(
+            "prebuild     {} pipelines selected by VICTORY_PREBUILD_ONLY",
+            jobs.len()
+        );
+    }
+    let trace = only.is_some();
+    // With `VICTORY_EMIT_DUMP=<dir>` as well: each selected pipeline's
+    // translated shaders as `<dir>/<stage>-<hash>.dxil` (game-derived, so
+    // never inside the repository).
+    let dump_dir = std::env::var_os("VICTORY_EMIT_DUMP")
+        .filter(|_| trace)
+        .map(PathBuf::from);
+    if let Some(dir) = &dump_dir {
+        victory_core::ensure_outside_repo(dir)?;
+        std::fs::create_dir_all(dir)?;
+    }
+    let dump = |job: Job| {
+        let Some(dir) = &dump_dir else { return };
+        let Job::Graphics(i) = job else { return };
+        let [ps, vs, gs, ..] = graphics[i].stages;
+        let stages = [("vertex", vs), ("mesh", gs), ("pixel", ps)];
+        for (stage, s) in stages {
+            let Some((c, _)) = s.and_then(|s| container(s.program)) else {
+                continue;
+            };
+            let name = format!("{stage}-{}.dxil", &blake3::hash(&c).to_hex()[..16]);
+            let path = dir.join(name);
+            if path.exists() {
+                continue;
+            }
+            if let (Ok(t), _) = victory_gpu::shader_cache::host_shader(&c) {
+                let _ = std::fs::write(path, &t.dxil);
+            }
+        }
+    };
     // Diagnostics, `VICTORY_PREBUILD_KEYS=<file>`: make nothing, list each
     // record's key (what a run lists pipelines by) with its shaders and
     // state as a run's `VICTORY_PIPELINE_LOG` has them, or why it is
@@ -233,7 +285,25 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
             .map(|_| {
                 s.spawn(|| {
                     while let Some(&job) = todo.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        if let Err(why) = prepare(job).and_then(|p| p.make()) {
+                        let one = Instant::now();
+                        if trace {
+                            use std::io::Write;
+                            println!("prebuild begin {}", shaders_of(job));
+                            let _ = std::io::stdout().flush();
+                        }
+                        let made = prepare(job).and_then(|p| p.make());
+                        dump(job);
+                        if trace {
+                            use std::io::Write;
+                            println!(
+                                "prebuild end {} ms={} {}",
+                                shaders_of(job),
+                                one.elapsed().as_millis(),
+                                made.as_ref().err().map_or("ok", |e| e.as_str())
+                            );
+                            let _ = std::io::stdout().flush();
+                        }
+                        if let Err(why) = made {
                             skip(why);
                         }
                     }
