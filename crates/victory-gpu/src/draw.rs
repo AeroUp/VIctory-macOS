@@ -657,8 +657,8 @@ impl State {
                         Some(&(_, offset)) => offset,
                         None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
                             // Where the root address lies in the copy its view shows.
-                            // Outside the title's buffers or unset: a null view
-                            // (`root_view`), at 0.
+                            // Outside the title's buffers, unset, or stale non-view data
+                            // from a previous root signature: a null view (`root_view`), at 0.
                             let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
                                 Some(&Root::View(address)) => match crate::shadow::find(address, 1) {
                                     Some(s) => match u32::try_from(s.offset(address)) {
@@ -667,8 +667,7 @@ impl State {
                                     },
                                     None => Ok(0),
                                 },
-                                None | Some(Root::None) => Ok(0),
-                                Some(_) => Err("a root view slot holds non-view root data"),
+                                _ => Ok(0),
                             };
                             match offset {
                                 Ok(offset) => offset,
@@ -817,10 +816,10 @@ impl State {
     fn root_view(&mut self, list: &HostList, compute: bool, slot: u8, uav: bool) -> Option<(u32, u32)> {
         let address = match self.roots_ref(compute).get(usize::from(slot)) {
             Some(&Root::View(address)) => address,
-            None | Some(Root::None) if !uav => 0,
+            _ if !uav => 0,
             _ => {
                 once!(slot, "a shader reads a root view the title did not set: dropped");
-                not_run("a root view the title did not set");
+                not_run("a writable root view the title did not set");
                 return None;
             }
         };

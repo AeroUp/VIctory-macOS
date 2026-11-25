@@ -840,23 +840,39 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
         }
     }
     let busy: Vec<(usize, usize)> = prepared.iter().map(|(_, _, from, n, _)| (*from, *n)).collect();
-    let _writing = crate::watch::writing_many(&busy);
-    for (copy, page, from, n, buf) in prepared {
-        let bytes = match &buf {
-            Some(b) => b.as_ptr(),
-            // SAFETY: `from` is inside `[copy.start, copy.start + copy.len)`.
-            None => unsafe { copy.data.add(from - copy.start as usize) },
-        };
-        crate::host::write_mapped(from as *mut u8, bytes, n);
-        if from == page && n == PAGE
-            && let Some(t) = &copy.tracked
-        {
-            t.taken(&[page / PAGE]);
+    let mut synced: std::collections::HashMap<usize, (Arc<Shadow>, Vec<usize>)> =
+        std::collections::HashMap::new();
+    {
+        let _writing = crate::watch::writing_many(&busy);
+        for (copy, page, from, n, buf) in prepared {
+            let bytes = match &buf {
+                Some(b) => b.as_ptr(),
+                // SAFETY: `from` is inside `[copy.start, copy.start + copy.len)`.
+                None => unsafe { copy.data.add(from - copy.start as usize) },
+            };
+            crate::host::write_mapped(from as *mut u8, bytes, n);
+            if from == page && n == PAGE && copy.tracked.is_some() {
+                let key = Arc::as_ptr(&copy) as usize;
+                synced
+                    .entry(key)
+                    .or_insert_with(|| (copy, Vec::new()))
+                    .1
+                    .push(page / PAGE);
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::MarkedPages, 1);
+                crate::copystat::add(crate::copystat::C::MarkedBytes, n as u64);
+            }
         }
-        #[cfg(feature = "diagnostics")]
-        {
-            crate::copystat::add(crate::copystat::C::MarkedPages, 1);
-            crate::copystat::add(crate::copystat::C::MarkedBytes, n as u64);
+    }
+    // Re-guard after `_writing` drops so `busy` does not skip them and
+    // `WritingMany::drop` does not immediately mark them dirty again.
+    for (_, (copy, mut pages)) in synced {
+        if let Some(t) = &copy.tracked {
+            pages.sort_unstable();
+            pages.dedup();
+            t.taken(&pages);
         }
     }
 }
