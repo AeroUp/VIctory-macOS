@@ -566,7 +566,7 @@ impl HostHeap {
     /// on first use from the slots made so far.
     pub(crate) fn view_addresses(&self) -> Option<u64> {
         let made = self.addresses.get_or_init(|| {
-            let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 8)?;
+            let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 16)?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -858,10 +858,17 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
 /// a buffer view's title address (dword 0 low, dword 1 bits 0-15 high);
 /// zeros for anything else.
 fn write_address(data: usize, index: usize, view: Option<&View>) {
-    let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
-    let words = [address as u32, (address >> 32) as u32 & 0xFFFF];
-    // SAFETY: the mapped view addresses hold 8 bytes per title slot.
-    unsafe { ((data + 8 * index) as *mut [u32; 2]).write_unaligned(words) };
+    let (address, len) = view.and_then(buffer_range).unwrap_or((0, 0));
+    let stride = view.map_or(0, |v| u64::from(view_stride(v)));
+    let num_records = if stride > 0 { len / stride } else { len } as u32;
+    let words = [
+        address as u32,
+        (address >> 32) as u32 & 0xFFFF,
+        num_records,
+        0,
+    ];
+    // SAFETY: the mapped view addresses hold 16 bytes per title slot.
+    unsafe { ((data + 16 * index) as *mut [u32; 4]).write_unaligned(words) };
 }
 
 /// The title memory a buffer shader or unordered access view reads: its

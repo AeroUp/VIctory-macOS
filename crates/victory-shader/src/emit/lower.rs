@@ -4720,8 +4720,10 @@ impl<'a> Lower<'a> {
     // 0); the other dwords stop the program when read; the table offset's
     // computed part is taken as whole descriptors (32-byte multiples).
     fn view_addresses(&mut self, inst: &Inst, site: Site, code: u8, count: u32) -> Result<(), Why> {
-        const OTHER: Why = "a descriptor read only as data";
-        let a = *self.scalar.get(&site).ok_or("a descriptor read only as data")?;
+        let a = *self
+            .scalar
+            .get(&site)
+            .ok_or("a descriptor read only as data")?;
         if !matches!(
             self.x.native.layout.get(a.param).map(|p| p.root),
             Some(RootType::Table | RootType::ResourceHeap)
@@ -4731,16 +4733,16 @@ impl<'a> Lower<'a> {
         let views = self.s.view_addresses_handle();
         for k in 0..count {
             let word = (a.offset / 4 + k) % 8;
-            let val = if word < 2 {
+            let val = if word < 3 {
                 let index = self.heap_index(site, k as u8, false)?;
                 let c = self.cur;
-                let three = self.s.m.i32(3);
-                let at = self.s.m.bin(c, Bin::Shl, index, three);
+                let four = self.s.m.i32(4);
+                let at = self.s.m.bin(c, Bin::Shl, index, four);
                 let w = self.s.m.i32(4 * word);
                 let at = self.s.m.bin(c, Bin::Add, at, w);
                 Val::I32(self.raw_dword(views, at))
             } else {
-                Val::Missing(OTHER)
+                Val::Missing("a descriptor read only as data")
             };
             if let Some(v) = inst.write(Reg::S(code + k as u8)) {
                 self.vals.insert(v, val);
