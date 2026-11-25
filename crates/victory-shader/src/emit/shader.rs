@@ -53,6 +53,10 @@ pub(crate) mod flags {
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const ROVS: u64 = 1 << 18;
+    /// Reads `SV_Barycentrics` (as DXC marks it: without it D3DMetal makes
+    /// the mesh program of the pipeline as if the pixel shader had none,
+    /// and Apple's compiler crashes on it).
+    pub const BARYCENTRICS: u64 = 1 << 22;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
     pub const ATOMIC64_TYPED: u64 = 1 << 27;
@@ -899,6 +903,9 @@ impl Shader {
         }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
+        }
+        if self.flags & flags::BARYCENTRICS != 0 {
+            features |= 0x2_0000;
         }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;

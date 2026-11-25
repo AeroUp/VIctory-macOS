@@ -1483,7 +1483,12 @@ impl<'a> Lower<'a> {
         self.load_input(id, col)
     }
 
-    /// Reads `SV_Barycentrics` (DXIL semantic kind 23, float3 `(b0, b1, b2)`).
+    /// Reads `SV_Barycentrics` (DXIL semantic kind 28, float3 `(b0, b1, b2)`),
+    /// declared as DXC declares it: a system value without a register,
+    /// and the `Barycentrics` shader flag. Declared in a register (or as
+    /// kind 23, which is `SV_GroupIndex`), it is an attribute the previous
+    /// stage never writes, and D3DMetal's mesh pipelines with it crashed
+    /// Apple's shader compiler (the pipeline then draws nothing).
     /// RDNA2 passes `(b1, b2)` in `index` 0 and 1.
     fn barycentric_input(&mut self, kind: Barycentric, index: u8) -> Val {
         let interp = match kind {
@@ -1493,24 +1498,16 @@ impl<'a> Lower<'a> {
             Barycentric::PerspectivePullModel => return Val::Missing("barycentrics read directly"),
             _ => 2,
         };
-        let id = match self.s.inputs.iter().position(|e| e.kind == 23) {
+        let id = match self.s.inputs.iter().position(|e| e.kind == 28) {
             Some(id) => id,
             None => {
-                let row = self
-                    .s
-                    .inputs
-                    .iter()
-                    .filter_map(|e| e.row)
-                    .map(|r| r + 1)
-                    .max()
-                    .unwrap_or(0);
                 self.s.inputs.push(SigElement {
                     name: "SV_Barycentrics".into(),
                     index: 0,
-                    kind: 23,
+                    kind: 28,
                     comp: 9,
                     interp,
-                    row: Some(row),
+                    row: None,
                     col: 0,
                     cols: 3,
                     usage: 0,
@@ -1519,7 +1516,7 @@ impl<'a> Lower<'a> {
                 self.s.inputs.len() - 1
             }
         };
-        // DXIL SV_Barycentrics has 3 components: (b0, b1, b2); RDNA2 index 0/1 are b1/b2.
+        self.s.flags |= flags::BARYCENTRICS;
         self.load_input(id, index + 1)
     }
 
