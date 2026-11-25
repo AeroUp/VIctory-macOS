@@ -100,7 +100,7 @@ pub(crate) const PAGE: usize = 64 << 10;
 
 /// The pages a tracker has not taken since they changed, and what it saves
 /// of pages it armed.
-struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>);
+struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>, std::sync::atomic::AtomicBool);
 
 /// Pages (page numbers) whose bytes a tracker keeps when they are first
 /// written after it took them, and those bytes: while shaders may be
@@ -329,7 +329,11 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     install();
     let end = start + len;
     let pages = start / PAGE..end.div_ceil(PAGE);
-    let changed = Arc::new(Changed(Mutex::new(pages.clone().collect()), Mutex::default()));
+    let changed = Arc::new(Changed(
+        Mutex::new(pages.clone().collect()),
+        Mutex::default(),
+        std::sync::atomic::AtomicBool::new(!pages.is_empty()),
+    ));
     let mut g = guards();
     for page in pages {
         g.holders.entry(page).or_default().push(changed.clone());
@@ -407,6 +411,9 @@ impl Tracked {
     /// `[from, to)`, in order. A page whose part in the tracked memory lies
     /// only partly in `[from, to)` is copied in part and stays changed.
     pub(crate) fn take(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        if !self.changed.2.load(std::sync::atomic::Ordering::Acquire) {
+            return Vec::new();
+        }
         let (from, to) = (from.max(self.start), to.min(self.end));
         if from >= to {
             return Vec::new();
@@ -444,6 +451,9 @@ impl Tracked {
         for page in protect(&mut g, &whole) {
             changed.remove(&page);
             self.changed.taken(page);
+        }
+        if changed.is_empty() {
+            self.changed.2.store(false, std::sync::atomic::Ordering::Release);
         }
         drop(changed);
         drop(g);
@@ -664,8 +674,11 @@ fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
             let first_write = c.0.lock().unwrap_or_else(|e| e.into_inner()).insert(page);
-            if first_write && save {
-                c.save(page);
+            if first_write {
+                c.2.store(true, std::sync::atomic::Ordering::Release);
+                if save {
+                    c.save(page);
+                }
             }
         }
         #[cfg(feature = "diagnostics")]

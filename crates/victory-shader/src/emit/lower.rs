@@ -10265,6 +10265,36 @@ impl<'a> Lower<'a> {
                             .map(Val::I32)
                             .unwrap_or_else(Val::Missing)
                     }
+                    Some(Val::Missing(_)) | None
+                        if live_edge
+                            && bit
+                            && self.mask_data == MaskData::Console
+                            && self.lane_any.contains_key(&arg) =>
+                    {
+                        let (m, at) = self.lane_any[&arg];
+                        match self.boolean(m, at) {
+                            Ok(b_val) => {
+                                let i32t = self.s.t.i32;
+                                let four =
+                                    self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                                let b = self.s.op(
+                                    at,
+                                    "waveActiveBallot",
+                                    Attr::NoUnwind,
+                                    four,
+                                    116,
+                                    &[b_val],
+                                );
+                                self.s.flags |= flags::WAVE_OPS;
+                                let x = self.s.m.extract(at, b, 0);
+                                let y = self.s.m.extract(at, b, 1);
+                                let xy = self.s.m.bin(at, Bin::Or, x, y);
+                                let z = self.s.m.i32(0);
+                                Val::Bit(self.s.m.cmp(at, pred::NE, xy, z))
+                            }
+                            Err(w) => Val::Missing(w),
+                        }
+                    }
                     other => match other {
                         Some(v) => v,
                         None => {
