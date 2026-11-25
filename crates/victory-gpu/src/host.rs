@@ -1970,9 +1970,10 @@ impl HostList {
                 }
                 Step::GpuWrite(shadow, address, len, marked) => {
                     // The shaders start from the title's data, which a
-                    // snapshot must hold (marked ranges keep none).
+                    // snapshot must hold (marked ranges keep none). Only this
+                    // shadow needs to be flushed before its snapshot is taken.
                     if !marked {
-                        batch.flush();
+                        batch.flush_one(shadow);
                     }
                     shadow.writing(*address, *len, *marked);
                     continue;
@@ -2102,6 +2103,33 @@ impl Batch {
             let b = a.saturating_add(n);
             !(a < end as u64 && (dst as u64) < b)
         });
+    }
+
+    /// Flushes only `target`'s pending refresh (used before an unmarked GPU
+    /// write takes a snapshot of `target`), leaving all other shadows batched.
+    fn flush_one(&mut self, target: &std::sync::Arc<crate::shadow::Shadow>) {
+        let key = std::sync::Arc::as_ptr(target) as usize;
+        let Some(idx) = self.pending.remove(&key) else {
+            return;
+        };
+        let (shadow, from, to) = self.refreshes.swap_remove(idx);
+        if idx < self.refreshes.len() {
+            let moved_key = std::sync::Arc::as_ptr(&self.refreshes[idx].0) as usize;
+            self.pending.insert(moved_key, idx);
+        }
+        let started = std::time::Instant::now();
+        let copied = shadow.update(from, to - from);
+        let us = started.elapsed().as_micros() as u64;
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::range(from, to - from, us, 0);
+        PREPARING[0].fetch_add(us, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
+        if from <= *b && *a <= to {
+            (*a, *b) = ((*a).min(from), (*b).max(to));
+        } else if to - from > *b - *a {
+            (*a, *b) = (from, to);
+        }
     }
 
     /// Does the refreshes; returns the bytes copied.

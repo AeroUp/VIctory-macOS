@@ -657,19 +657,23 @@ impl State {
                         Some(&(_, offset)) => offset,
                         None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
                             // Where the root address lies in the copy its view shows.
-                            // Outside the title's buffers: a null view
+                            // Outside the title's buffers or unset: a null view
                             // (`root_view`), at 0.
                             let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
                                 Some(&Root::View(address)) => match crate::shadow::find(address, 1) {
-                                    Some(s) => u32::try_from(s.offset(address)).ok(),
-                                    None => Some(0),
+                                    Some(s) => match u32::try_from(s.offset(address)) {
+                                        Ok(off) => Ok(off),
+                                        Err(_) => Err("a root view offset past 4 GiB"),
+                                    },
+                                    None => Ok(0),
                                 },
-                                _ => None,
+                                None | Some(Root::None) => Ok(0),
+                                Some(_) => Err("a root view slot holds non-view root data"),
                             };
                             match offset {
-                                Some(offset) => offset,
-                                None => {
-                                    not_run("a root view offset past 4 GiB or unset");
+                                Ok(offset) => offset,
+                                Err(why) => {
+                                    not_run(why);
                                     return false;
                                 }
                             }
@@ -811,10 +815,14 @@ impl State {
     /// shortcut: what shaders write through a root UAV goes back to title
     /// memory for 1 MiB from its address, as before the views.
     fn root_view(&mut self, list: &HostList, compute: bool, slot: u8, uav: bool) -> Option<(u32, u32)> {
-        let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
-            once!(slot, "a shader reads a root view the title did not set: dropped");
-            not_run("a root view the title did not set");
-            return None;
+        let address = match self.roots_ref(compute).get(usize::from(slot)) {
+            Some(&Root::View(address)) => address,
+            None | Some(Root::None) if !uav => 0,
+            _ => {
+                once!(slot, "a shader reads a root view the title did not set: dropped");
+                not_run("a root view the title did not set");
+                return None;
+            }
         };
         // An address in none of the title's buffers (0: a view the title
         // left unset, which the shader need not read) is a null view, read
