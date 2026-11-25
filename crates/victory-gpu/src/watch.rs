@@ -171,6 +171,9 @@ struct Guards {
     /// Pages that faulted repeatedly and skip `VirtualProtect` for `n`
     /// `protect` calls (unless armed) so per-frame buffers avoid fault storms.
     hot: BTreeMap<usize, u8>,
+    /// Cached runtime-memory classification of page ranges, invalidated on
+    /// remap/alias/track so `protect` does not re-query every page each frame.
+    regions: RuntimeRegions,
     /// Tracked pages written this frame and the frame before (diagnostics).
     #[cfg(feature = "diagnostics")]
     written: BTreeSet<usize>,
@@ -185,6 +188,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     alias_of: BTreeMap::new(),
     faults: BTreeMap::new(),
     hot: BTreeMap::new(),
+    regions: RuntimeRegions::new(),
     #[cfg(feature = "diagnostics")]
     written: BTreeSet::new(),
     #[cfg(feature = "diagnostics")]
@@ -349,6 +353,7 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
         std::sync::atomic::AtomicU64::new(0),
     ));
     let mut g = guards();
+    g.regions.invalidate(pages.start, pages.end);
     for page in pages {
         g.holders.entry(page).or_default().push(changed.clone());
     }
@@ -696,51 +701,46 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
     };
     let mut taken = Vec::with_capacity(pages.len());
     let busy = |page: usize| g.busy.iter().any(|&(a, b)| (a..b).contains(&page));
-    let pages: Vec<usize> = pages
-        .iter()
-        .copied()
-        .filter(|&p| {
-            if busy(p) {
-                return false;
-            }
-            if let Some(left) = g.hot.get_mut(&p) {
-                let armed = g
-                    .holders
-                    .get(&p)
-                    .is_some_and(|hs| hs.iter().any(|h| h.is_armed(p)));
-                if armed {
-                    g.hot.remove(&p);
-                    return true;
-                }
-                if *left > 1 {
-                    *left -= 1;
-                    return false;
-                }
-                g.hot.remove(&p);
-            }
-            true
-        })
-        .collect();
-    // Only the runtime's GPU memory is guarded. A tracked range can start
-    // in free or reserved memory and run on into the host's own pages: in
-    // #50 that guarded the process heap's header, and a thread holding the
-    // heap lock then faulted while another held `Guards` and allocated,
-    // a deadlock. Pages left out stay changed, so they are copied whole.
-    let mut regions = RuntimeRegions::default();
-    let pages: Vec<usize> = pages.into_iter().filter(|&p| regions.contains(p)).collect();
-    let mut i = 0;
-    while i < pages.len() {
-        if g.protected.contains(&pages[i]) {
-            taken.push(pages[i]);
-            i += 1;
+    let mut to_guard = Vec::with_capacity(pages.len());
+    for &p in pages {
+        if busy(p) {
             continue;
         }
+        if let Some(left) = g.hot.get_mut(&p) {
+            let armed = g
+                .holders
+                .get(&p)
+                .is_some_and(|hs| hs.iter().any(|h| h.is_armed(p)));
+            if armed {
+                g.hot.remove(&p);
+            } else if *left > 1 {
+                *left -= 1;
+                continue;
+            } else {
+                g.hot.remove(&p);
+            }
+        }
+        if g.protected.contains(&p) {
+            taken.push(p);
+            continue;
+        }
+        // Only the runtime's GPU memory is guarded. A tracked range can start
+        // in free or reserved memory and run on into the host's own pages: in
+        // #50 that guarded the process heap's header, and a thread holding the
+        // heap lock then faulted while another held `Guards` and allocated,
+        // a deadlock. Pages left out stay changed, so they are copied whole.
+        if g.regions.contains(p) {
+            to_guard.push(p);
+        }
+    }
+    let mut i = 0;
+    while i < to_guard.len() {
         // A run of consecutive pages not guarded yet.
         let first = i;
-        while i + 1 < pages.len() && pages[i + 1] == pages[i] + 1 && !g.protected.contains(&pages[i + 1]) {
+        while i + 1 < to_guard.len() && to_guard[i + 1] == to_guard[i] + 1 {
             i += 1;
         }
-        let run = &pages[first..=i];
+        let run = &to_guard[first..=i];
         i += 1;
         #[cfg(feature = "diagnostics")]
         counted(1, run.len() as u64);
@@ -768,13 +768,52 @@ struct RuntimeRegions {
     /// The last region asked about: its pages and whether it is runtime
     /// memory.
     last: Option<(usize, usize, bool)>,
-    /// Sorted non-overlapping cached regions, cleared on remap.
+    /// Sorted non-overlapping cached regions, invalidated on remap/alias/track.
     regions: Vec<(usize, usize, bool)>,
 }
 
 impl RuntimeRegions {
+    const fn new() -> Self {
+        Self {
+            last: None,
+            regions: Vec::new(),
+        }
+    }
+
+    fn invalidate(&mut self, first: usize, last: usize) {
+        if first >= last {
+            return;
+        }
+        if let Some((a, b, _)) = self.last
+            && a < last
+            && b > first
+        {
+            self.last = None;
+        }
+        let start = self.regions.partition_point(|&(_, b, _)| b <= first);
+        let mut i = start;
+        while i < self.regions.len() && self.regions[i].0 < last {
+            let (a, b, yes) = self.regions[i];
+            if a < first && b > last {
+                self.regions[i] = (a, first, yes);
+                self.regions.insert(i + 1, (last, b, yes));
+                break;
+            } else if a < first {
+                self.regions[i] = (a, first, yes);
+                i += 1;
+            } else if b > last {
+                self.regions[i] = (last, b, yes);
+                break;
+            } else {
+                self.regions.remove(i);
+            }
+        }
+    }
+
     fn contains(&mut self, page: usize) -> bool {
-        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        use windows_sys::Win32::System::Memory::{
+            GetWriteWatch, MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        };
         if let Some((a, b, yes)) = self.last
             && (a..b).contains(&page)
         {
@@ -795,21 +834,43 @@ impl RuntimeRegions {
         if n == 0 {
             return false;
         }
-        let yes = runtime_memory(page * PAGE, true);
+        let yes = if info.State == MEM_COMMIT && info.Type == MEM_PRIVATE {
+            let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
+            // SAFETY: room for one answer; no reset, so nothing changes.
+            let rc = unsafe {
+                GetWriteWatch(
+                    0,
+                    (page * PAGE) as *const _,
+                    4096,
+                    (&raw mut found).cast(),
+                    &mut count,
+                    &mut granularity,
+                )
+            };
+            rc == 0
+        } else {
+            true
+        };
         let (base, size) = (info.BaseAddress as usize, info.RegionSize);
         // In our pages, rounded inward so the region never claims a page it
         // only shares.
-        let (a, b) = (base.div_ceil(PAGE).min(page), ((base + size) / PAGE).max(page + 1));
-        self.last = Some((a, b, yes));
-        if self.regions.len() >= 512 {
+        let (mut a, mut b) = (base.div_ceil(PAGE).min(page), ((base + size) / PAGE).max(page + 1));
+        if self.regions.len() >= 16_384 {
             self.regions.clear();
         }
-        let pos = self.regions.partition_point(|&(ra, _, _)| ra < a);
-        if pos < self.regions.len() && self.regions[pos].0 == a {
-            self.regions[pos] = (a, b, yes);
-        } else {
-            self.regions.insert(pos, (a, b, yes));
+        self.invalidate(a, b);
+        let mut pos = self.regions.partition_point(|&(ra, _, _)| ra < a);
+        if pos > 0 && self.regions[pos - 1].1 == a && self.regions[pos - 1].2 == yes {
+            a = self.regions[pos - 1].0;
+            pos -= 1;
+            self.regions.remove(pos);
         }
+        if pos < self.regions.len() && self.regions[pos].0 == b && self.regions[pos].2 == yes {
+            b = self.regions[pos].1;
+            self.regions.remove(pos);
+        }
+        self.regions.insert(pos, (a, b, yes));
+        self.last = Some((a, b, yes));
         yes
     }
 }
@@ -967,6 +1028,7 @@ pub fn writing(at: usize, len: usize) -> Writing {
 pub fn title_memory_remapped(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
+    g.regions.invalidate(first, last);
     // What it showed is gone already: nothing to keep.
     changed(&mut g, first, last, false);
     // What it showed is not what it shows now: its links go, both ways.
@@ -990,6 +1052,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 pub fn title_memory_aliased(at: usize, others: &[usize]) {
     let mut g = guards();
     let page = at / PAGE;
+    g.regions.invalidate(page, page + 1);
     for &other in others {
         for (x, y) in [(other / PAGE, page), (page, other / PAGE)] {
             let links = g.alias_of.entry(x).or_default();
