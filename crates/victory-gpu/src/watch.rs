@@ -749,6 +749,52 @@ impl Drop for Writing {
 /// keeps them open while the result lives. The runtime calls it (as
 /// `kernel_will_write`) around the title's kernel reads into its own
 /// memory and DirectStorage's writes to addresses.
+/// Batched [`Writing`] for multiple ranges under two guard-lock acquisitions
+/// instead of two per range.
+pub(crate) struct WritingMany {
+    ranges: Vec<(usize, usize)>,
+}
+
+impl Drop for WritingMany {
+    fn drop(&mut self) {
+        if self.ranges.is_empty() {
+            return;
+        }
+        let mut g = guards();
+        for &(first, last) in &self.ranges {
+            if let Some(i) = g.busy.iter().position(|&r| r == (first, last)) {
+                g.busy.swap_remove(i);
+            }
+            changed(&mut g, first, last, false);
+        }
+    }
+}
+
+pub(crate) fn writing_many(ranges: &[(usize, usize)]) -> WritingMany {
+    let mut spans: Vec<(usize, usize)> = ranges
+        .iter()
+        .map(|&(at, len)| (at / PAGE, at.saturating_add(len).div_ceil(PAGE)))
+        .filter(|&(a, b)| a < b)
+        .collect();
+    if spans.is_empty() {
+        return WritingMany { ranges: Vec::new() };
+    }
+    spans.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for (a, b) in spans {
+        match merged.last_mut() {
+            Some((_, end)) if a <= *end => *end = (*end).max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    let mut g = guards();
+    for &(first, last) in &merged {
+        g.busy.push((first, last));
+        changed(&mut g, first, last, false);
+    }
+    WritingMany { ranges: merged }
+}
+
 pub fn writing(at: usize, len: usize) -> Writing {
     writing_inner(at, len, true)
 }

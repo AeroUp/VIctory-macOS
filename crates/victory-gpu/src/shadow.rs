@@ -439,14 +439,15 @@ impl Shadow {
     // shortcut: a page the title wrote that was not armed (a write through
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
-    pub(crate) fn copy_back_marked(&self, page: usize) -> usize {
-        let Some(t) = &self.tracked else {
-            return 0;
-        };
+    /// Compares marked page `page` and returns `(from, n, buf)` if bytes need
+    /// writing back to title memory (`buf` is `Some` when merged with `saved`,
+    /// or `None` to write directly from `self.data` at `from - start`).
+    fn prepare_marked(&self, page: usize) -> Option<(usize, usize, Option<Vec<u8>>)> {
+        let t = self.tracked.as_ref()?;
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         if from >= to {
-            return 0;
+            return None;
         }
         // Our own write below must not save the page for this copy again.
         t.unarm(page / PAGE);
@@ -454,19 +455,19 @@ impl Shadow {
         if saved.is_none() && t.changed(page / PAGE) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::MarkedKept, 1);
-            return 0;
+            return None;
         }
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
         let mut title = vec![0u8; n];
         if !crate::host::read_into(from as *const u8, &mut title) {
-            return 0;
+            return None;
         }
-        let written = match &saved {
+        let out = match &saved {
             // The title's bytes are the copy's from before: what differs is
             // the shaders'.
-            None => (*host != title[..]).then_some(host.as_ptr()),
+            None => (*host != title[..]).then_some(None),
             Some(before) => {
                 let before = &before[from - page..to - page];
                 let mut changed = false;
@@ -477,18 +478,17 @@ impl Shadow {
                     }
                     *h = *t;
                 }
-                changed.then_some(title.as_ptr())
+                changed.then_some(Some(title))
             }
         };
-        if let Some(bytes) = written {
-            let _writing = crate::watch::writing_nosave(from, n);
-            crate::host::write_mapped(from as *mut u8, bytes, n);
+        if let Some(buf) = out {
+            Some((from, n, buf))
+        } else {
+            if from == page && to == page + PAGE {
+                t.taken(&[page / PAGE]);
+            }
+            None
         }
-        // Equal to title memory now: taken, unless it holds the page in part.
-        if from == page && to == page + PAGE {
-            t.taken(&[page / PAGE]);
-        }
-        written.map_or(0, |_| n)
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -774,6 +774,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
             })
             .collect()
     };
+    let mut prepared = Vec::new();
     for (copy, page) in pages {
         if withheld
             .iter()
@@ -781,14 +782,33 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
         {
             continue;
         }
-        let written = copy.copy_back_marked(page);
+        let prep = copy.prepare_marked(page);
+        if let Some((from, n, buf)) = prep {
+            prepared.push((copy, page, from, n, buf));
+        } else {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::MarkedPages, 1);
+        }
+    }
+    let busy: Vec<(usize, usize)> = prepared.iter().map(|(_, _, from, n, _)| (*from, *n)).collect();
+    let _writing = crate::watch::writing_many(&busy);
+    for (copy, page, from, n, buf) in prepared {
+        let bytes = match &buf {
+            Some(b) => b.as_ptr(),
+            // SAFETY: `from` is inside `[copy.start, copy.start + copy.len)`.
+            None => unsafe { copy.data.add(from - copy.start as usize) },
+        };
+        crate::host::write_mapped(from as *mut u8, bytes, n);
+        if from == page && n == PAGE
+            && let Some(t) = &copy.tracked
+        {
+            t.taken(&[page / PAGE]);
+        }
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::MarkedPages, 1);
-            crate::copystat::add(crate::copystat::C::MarkedBytes, written as u64);
+            crate::copystat::add(crate::copystat::C::MarkedBytes, n as u64);
         }
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = written;
     }
 }
 
