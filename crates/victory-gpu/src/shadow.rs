@@ -91,7 +91,7 @@ fn give_back(v: Vec<u8>) {
 fn pool_bytes() -> usize {
     static LIMIT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         if crate::watch::rosetta() {
-            256 << 20
+            64 << 20
         } else {
             2 << 30
         }
@@ -843,7 +843,6 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let key = map
         .range(..=(address, usize::MAX))
         .rev()
-        .take(64)
         .find(|(_, e)| e.end >= end)
         .map(|(k, _)| *k);
     let Some(key) = key else {

@@ -164,6 +164,8 @@ struct Guards {
     /// Pages that faulted repeatedly and skip `VirtualProtect` for `n`
     /// `protect` calls (unless armed) so per-frame buffers avoid fault storms.
     hot: BTreeMap<usize, u8>,
+    /// Cached runtime-region check across `protect` calls.
+    regions: RuntimeRegions,
     /// Tracked pages written this frame and the frame before (diagnostics).
     #[cfg(feature = "diagnostics")]
     written: BTreeSet<usize>,
@@ -178,6 +180,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     alias_of: BTreeMap::new(),
     faults: BTreeMap::new(),
     hot: BTreeMap::new(),
+    regions: RuntimeRegions { last: None },
     #[cfg(feature = "diagnostics")]
     written: BTreeSet::new(),
     #[cfg(feature = "diagnostics")]
@@ -565,8 +568,7 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
     // #50 that guarded the process heap's header, and a thread holding the
     // heap lock then faulted while another held `Guards` and allocated,
     // a deadlock. Pages left out stay changed, so they are copied whole.
-    let mut allowed = RuntimeRegions::default();
-    let pages: Vec<usize> = pages.into_iter().filter(|&p| allowed.contains(p)).collect();
+    let pages: Vec<usize> = pages.into_iter().filter(|&p| g.regions.contains(p)).collect();
     let mut i = 0;
     while i < pages.len() {
         if g.protected.contains(&pages[i]) {
@@ -724,6 +726,7 @@ pub fn writing(at: usize, len: usize) -> Writing {
 pub fn title_memory_remapped(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
+    g.regions.last = None;
     // What it showed is gone already: nothing to keep.
     changed(&mut g, first, last, false);
     // What it showed is not what it shows now: its links go, both ways.

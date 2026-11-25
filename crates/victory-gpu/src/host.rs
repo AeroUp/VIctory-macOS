@@ -1934,7 +1934,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.title_written();
+                    batch.title_written_range(dst, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
@@ -2055,6 +2055,22 @@ impl Batch {
         self.flush();
         self.textures.clear();
         self.current.clear();
+    }
+
+    /// Before a copy into `[dst, dst + len)`: only flush/invalidate copies
+    /// whose title range overlaps `[dst, dst + len)`, keeping unrelated
+    /// copies in `current` across `Step::Copy` steps.
+    fn title_written_range(&mut self, dst: usize, len: usize) {
+        let end = dst.saturating_add(len);
+        if self.refreshes.iter().any(|(_, from, to)| *from < end && dst < *to) {
+            self.flush();
+        }
+        self.textures.clear();
+        self.current.retain(|_, (s, _, _)| {
+            let (a, n) = s.range();
+            let b = a.saturating_add(n);
+            !(a < end as u64 && (dst as u64) < b)
+        });
     }
 
     /// Does the refreshes; returns the bytes copied.

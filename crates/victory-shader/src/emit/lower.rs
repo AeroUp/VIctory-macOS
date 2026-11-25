@@ -190,6 +190,8 @@ struct Lower<'a> {
     bools: HashMap<(usize, Bool), V>,
     lane_bits: HashMap<Value, V>,
     lane_highs: HashMap<Value, Value>,
+    /// `SCC` written by scalar mask ops (`!= 0`), emitted lazily if read as data.
+    lane_any: HashMap<Value, (Bool, usize)>,
     /// IR phi location by value.
     phi_at: HashMap<Value, (usize, usize)>,
     mask_phis: HashMap<Value, V>,
@@ -596,6 +598,7 @@ impl<'a> Lower<'a> {
             bools: HashMap::new(),
             lane_bits: HashMap::new(),
             lane_highs: HashMap::new(),
+            lane_any: HashMap::new(),
             phi_at,
             mask_phis: HashMap::new(),
             pending_masks: Vec::new(),
@@ -1614,6 +1617,25 @@ impl<'a> Lower<'a> {
                 let lo = self.lane_highs[&v];
                 let bit = self.lane_bits[&lo];
                 return self.ballot_bit(lo, bit, true).map(Val::I32);
+            }
+            Some(&Val::Missing(_)) | None
+                if self.mask_ok && self.lane_any.contains_key(&v) =>
+            {
+                let (m, at) = self.lane_any[&v];
+                let bit = self.boolean(m, at)?;
+                let i32t = self.s.t.i32;
+                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                let b = self
+                    .s
+                    .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+                self.s.flags |= flags::WAVE_OPS;
+                let x = self.s.m.extract(at, b, 0);
+                let y = self.s.m.extract(at, b, 1);
+                let xy = self.s.m.bin(at, Bin::Or, x, y);
+                let z = self.s.m.i32(0);
+                let any = self.s.m.cmp(at, pred::NE, xy, z);
+                self.vals.insert(v, Val::Bit(any));
+                return Ok(Val::Bit(any));
             }
             Some(&Val::Missing(w)) => return Err(w),
             Some(&val) => return Ok(val),
@@ -3397,7 +3419,7 @@ impl<'a> Lower<'a> {
             Err(why) if effect => Err(unsupported(offset, why)),
             Err(why) => {
                 for &(_, v) in &inst.writes {
-                    self.vals.insert(v, Val::Missing(why));
+                    self.vals.entry(v).or_insert(Val::Missing(why));
                 }
                 Ok(())
             }
@@ -3420,6 +3442,13 @@ impl<'a> Lower<'a> {
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
+            if let Some(scc) = scc
+                && self.mask_ok
+                && let Some(m_lo) = lo.or_else(|| inst.write(Reg::S(EXEC)))
+                && let Some(&m) = self.x.st.masks.get(&m_lo)
+            {
+                self.lane_any.insert(scc, (m, self.cur));
+            }
             return Err(LANE_MASK);
         }
         if matches!(
