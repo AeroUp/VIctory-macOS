@@ -908,21 +908,42 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
 fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
     open_many(g, &guarded);
+    // Gather each tracker's pages in the range first: a title write covers
+    // millions of pages, and a lock and a set insertion per page (and per
+    // tracker holding it) was seconds of a frame. One lock per tracker, then
+    // an ascending extend, keeps the same result.
+    let mut trackers: Vec<(&Arc<Changed>, Vec<usize>)> = Vec::new();
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
-            if save {
-                c.3.store(0, std::sync::atomic::Ordering::Release);
-            }
-            let first_write = c.0.lock().unwrap_or_else(|e| e.into_inner()).insert(page);
-            if first_write {
-                c.2.store(true, std::sync::atomic::Ordering::Release);
-                if save {
-                    c.save(page);
-                }
+            match trackers.iter_mut().find(|(t, _)| Arc::ptr_eq(t, c)) {
+                Some((_, pages)) => pages.push(page),
+                None => trackers.push((c, vec![page])),
             }
         }
         #[cfg(feature = "diagnostics")]
         g.written.insert(page);
+    }
+    for (c, pages) in trackers {
+        if save {
+            c.3.store(0, std::sync::atomic::Ordering::Release);
+        }
+        let mut fresh: Vec<usize> = Vec::new();
+        {
+            let mut set = c.0.lock().unwrap_or_else(|e| e.into_inner());
+            for page in pages {
+                if set.insert(page) {
+                    fresh.push(page);
+                }
+            }
+        }
+        if !fresh.is_empty() {
+            c.2.store(true, std::sync::atomic::Ordering::Release);
+            if save {
+                for page in fresh {
+                    c.save(page);
+                }
+            }
+        }
     }
     !guarded.is_empty()
 }
