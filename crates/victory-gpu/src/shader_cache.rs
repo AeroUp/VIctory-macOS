@@ -224,6 +224,41 @@ fn cached(
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> (Result<HostShader, String>, bool) {
+    let out = cached_inner(cache, build, container, translate);
+    dump_refused(container, &out.0);
+    out
+}
+
+/// `VICTORY_SHADER_DUMP=<folder>`: a container that does not translate is
+/// written there as `<hash>.dxbc`, under the hash its refusal is logged
+/// with, so it can be read with `victory shader-info --disasm`. The game's
+/// own bytes: keep them out of the repository.
+fn dump_refused(container: &[u8], result: &Result<HostShader, String>) {
+    #[cfg(feature = "diagnostics")]
+    {
+        if result.is_ok() {
+            return;
+        }
+        let Some(dir) = std::env::var_os("VICTORY_SHADER_DUMP") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let hash = &blake3::hash(container).to_hex()[..16];
+        if let Err(e) = std::fs::write(dir.join(format!("{hash}.dxbc")), container) {
+            tracing::warn!(error = %e, "shader not dumped");
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (container, result);
+}
+
+fn cached_inner(
+    cache: &Cache,
+    build: &[u8; 32],
+    container: &[u8],
+    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
+) -> (Result<HostShader, String>, bool) {
     let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
