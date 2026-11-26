@@ -24,7 +24,10 @@ pub(crate) struct HostHeap {
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
-    made: Mutex<Vec<u64>>,
+    /// A lock a slot, not the heap: a slot is made from the driver (about
+    /// ten microseconds) with its lock held, and a world frame's recording
+    /// threads make different slots at once.
+    made: Vec<Mutex<u64>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -213,7 +216,7 @@ impl HostHeap {
             count,
             dynamic: extra,
             sampler,
-            made: Mutex::new(vec![0; count as usize]),
+            made: (0..count).map(|_| Mutex::new(0)).collect(),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
@@ -573,8 +576,8 @@ impl HostHeap {
             let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 16)?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
-            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            for (i, &key) in made.iter().enumerate() {
+            for (i, slot) in self.made.iter().enumerate() {
+                let key = *slot.lock().unwrap_or_else(|e| e.into_inner());
                 let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
                 write_address(data, i, view.as_ref());
             }
@@ -679,19 +682,23 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+        // The slot's own lock: several recording threads make different
+        // slots at once, each with the driver under its lock.
+        let mut made = self.made[index as usize]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
-            if made[index as usize] != 0 {
-                made[index as usize] = 0;
+            if *made != 0 {
+                *made = 0;
                 self.make_null(index);
                 self.note_address(index, None);
             }
             return None;
         };
-        if made[index as usize] != key {
+        if *made != key {
             let placed = is_placed_texture(&view);
             // Defer placed textures on `!for_draw`, and also defer other view
             // slots until either a draw binds a table (`for_draw`) or a shader
@@ -709,7 +716,7 @@ impl HostHeap {
                     || (!self.sampler
                         && !self.heap_indexed.load(std::sync::atomic::Ordering::Acquire)));
             if later {
-                made[index as usize] = 0;
+                *made = 0;
                 if gpu_tex_unmade {
                     null_for(&view, self.cpu(index));
                 }
@@ -723,7 +730,7 @@ impl HostHeap {
             }
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
-            made[index as usize] = key;
+            *made = key;
             let (kept, mark) = make_marked(&view, self.cpu(index));
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
@@ -782,7 +789,11 @@ impl HostHeap {
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
+        let key = *self
+            .made
+            .get(index as usize)?
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // A view the host could not make leaves a null view, its record
         // noted all the same; it keeps no resource.
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(Option::is_some);
@@ -801,7 +812,10 @@ impl HostHeap {
     /// Whether slot `index` was made from a record (tests).
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {
-        self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] != 0
+        *self.made[index as usize]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            != 0
     }
 }
 
