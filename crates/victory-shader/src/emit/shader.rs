@@ -142,6 +142,9 @@ pub(crate) struct Shader {
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
+    /// Dwords reserved past the console's shared memory (a cross-half
+    /// reduction exchanges its halves' partials there).
+    pub scratch_dwords: u32,
     lds: Option<V>,
     main: V,
     pub entry: usize,
@@ -204,6 +207,7 @@ impl Shader {
             threads: None,
             wave_size: None,
             lds_dwords: 0,
+            scratch_dwords: 0,
             lds: None,
             main,
             entry,
@@ -216,7 +220,7 @@ impl Shader {
         if let Some(g) = self.lds {
             return g;
         }
-        let arr = self.m.array(self.lds_dwords, self.t.i32);
+        let arr = self.m.array(self.lds_dwords + self.scratch_dwords, self.t.i32);
         let g = self.m.global("lds", arr, 3);
         self.lds = Some(g);
         g

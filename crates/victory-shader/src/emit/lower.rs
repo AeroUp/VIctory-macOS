@@ -277,6 +277,10 @@ struct Lower<'a> {
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
+    /// In halves: the IR blocks every thread of the group runs exactly once
+    /// (they post-dominate the entry and no cycle reaches them again), where
+    /// a cross-half exchange's barriers are legal.
+    across_blocks: Option<Vec<bool>>,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -689,6 +693,7 @@ impl<'a> Lower<'a> {
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
+            across_blocks: None,
             code_table: None,
             counters: HashMap::new(),
             abort: None,
@@ -1082,6 +1087,19 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Whether a whole-wave section leaves a reduction (which in halves
+    /// needs the scratch its two halves exchange in).
+    fn sections_have_across(&self) -> bool {
+        use super::wave::Shape;
+        self.sections.values().any(|sections| {
+            sections.values().any(|s| {
+                s.shapes
+                    .values()
+                    .any(|sh| matches!(sh, Shape::Active(..) | Shape::Half(..)))
+            })
+        })
+    }
+
     /// An instruction inside a whole-wave section: the values that leave
     /// the section are made from what the simulation found them to be.
     fn section_inst(&mut self, b: usize, i: usize, start: usize) {
@@ -1198,7 +1216,23 @@ impl<'a> Lower<'a> {
         {
             return Err("a wave reduction in a mesh shader");
         }
-        self.same_half(ACROSS)?;
+        // In halves, a console wave is two host waves: the reduction is two
+        // partials joined through shared memory and a barrier. The barrier
+        // is legal where every thread of the group runs the block exactly
+        // once, which `across_blocks` says.
+        let across = self.halves && !self.one_host_wave();
+        if across {
+            if prefix.is_some() {
+                return Err(ACROSS);
+            }
+            let block = self.cur_ir;
+            let uniform = self.across_blocks()[block];
+            if !uniform {
+                return Err(
+                    "a wave reduction in control flow that not every thread of the group runs (a cross-half exchange needs a barrier there)",
+                );
+            }
+        }
         let c = self.cur;
         let &m = self
             .x
@@ -1263,7 +1297,165 @@ impl<'a> Lower<'a> {
                 )
             }
         };
-        Ok(if float { self.as_int(r) } else { r })
+        let r = if float { self.as_int(r) } else { r };
+        if across {
+            return Ok(self.across_reduce(r, ident, op, float));
+        }
+        Ok(r)
+    }
+
+    /// The blocks every thread of the group runs exactly once: a barrier
+    /// there is reached by both halves of each console wave, and by every
+    /// wave (blocks inside a branch or a loop can be reached by fewer).
+    fn across_blocks(&mut self) -> &Vec<bool> {
+        if self.across_blocks.is_some() {
+            return self.across_blocks.as_ref().expect("made above");
+        }
+        let p = self.x.p;
+        let n = p.blocks.len();
+        let succ: Vec<Vec<usize>> = p.blocks.iter().map(|b| b.exit.successors()).collect();
+        // Post-dominators, as bitsets (a block with no successors holds
+        // itself alone, as `halves::lane_regions` takes them).
+        let words = n.div_ceil(64);
+        let full = vec![u64::MAX; words];
+        let mut pdom: Vec<Vec<u64>> = (0..n)
+            .map(|b| {
+                if succ[b].is_empty() {
+                    let mut v = vec![0; words];
+                    v[b / 64] |= 1 << (b % 64);
+                    v
+                } else {
+                    full.clone()
+                }
+            })
+            .collect();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in (0..n).rev() {
+                if succ[b].is_empty() {
+                    continue;
+                }
+                let mut v = full.clone();
+                for &t in &succ[b] {
+                    for (w, p) in v.iter_mut().zip(&pdom[t]) {
+                        *w &= p;
+                    }
+                }
+                v[b / 64] |= 1 << (b % 64);
+                if v != pdom[b] {
+                    pdom[b] = v;
+                    changed = true;
+                }
+            }
+        }
+        // Whether `b` can reach itself: inside a cycle, a thread may run it
+        // any number of times.
+        let in_cycle: Vec<bool> = (0..n)
+            .map(|b| {
+                let mut seen = vec![false; n];
+                let mut stack: Vec<usize> = succ[b].clone();
+                while let Some(t) = stack.pop() {
+                    if t == b {
+                        return true;
+                    }
+                    if std::mem::replace(&mut seen[t], true) {
+                        continue;
+                    }
+                    stack.extend(succ[t].iter().copied());
+                }
+                false
+            })
+            .collect();
+        let entry = &pdom[0];
+        let out = (0..n)
+            .map(|b| entry[b / 64] >> (b % 64) & 1 == 1 && !in_cycle[b])
+            .collect();
+        self.across_blocks = Some(out);
+        self.across_blocks.as_ref().expect("just made")
+    }
+
+    /// Combines two halves' partial results of `op`, both as the i32 bits
+    /// the registers hold.
+    fn combine_pair(&mut self, op: super::wave::Op, float: bool, a: V, b: V) -> V {
+        use super::wave::Op;
+        let c = self.cur;
+        let pick = |l: &mut Self, p: u8| {
+            let keep = l.s.m.cmp(c, p, a, b);
+            l.s.m.select(c, keep, a, b)
+        };
+        if float {
+            let (fa, fb) = (self.as_float(a), self.as_float(b));
+            let r = match op {
+                Op::AddF => self.s.m.bin(c, Bin::Add, fa, fb),
+                Op::MinF => {
+                    let keep = self.s.m.cmp(c, pred::OLT, fa, fb);
+                    self.s.m.select(c, keep, fa, fb)
+                }
+                _ => {
+                    let keep = self.s.m.cmp(c, pred::OGT, fa, fb);
+                    self.s.m.select(c, keep, fa, fb)
+                }
+            };
+            return self.as_int(r);
+        }
+        match op {
+            Op::AddU => self.s.m.bin(c, Bin::Add, a, b),
+            Op::Or => self.s.m.bin(c, Bin::Or, a, b),
+            Op::And => self.s.m.bin(c, Bin::And, a, b),
+            Op::Xor => self.s.m.bin(c, Bin::Xor, a, b),
+            Op::MinU => pick(self, pred::IULT),
+            Op::MaxU => pick(self, pred::IUGT),
+            Op::MinI => pick(self, pred::SLT),
+            _ => pick(self, pred::SGT),
+        }
+    }
+
+    /// A reduction's value over both 32-lane halves of the console wave:
+    /// this host wave's partial in shared memory, the other half's beside
+    /// it, the two combined. Each half writes one dword of the scratch
+    /// reserved past the console's shared memory, at its host wave's index
+    /// in the group (the two halves of a console wave are adjacent), and a
+    /// wave whose other half does not exist (a group of 32 thread run as
+    /// one) reads the identity.
+    fn across_reduce(&mut self, partial: V, ident: u32, op: super::wave::Op, float: bool) -> V {
+        use super::wave::Op;
+        let _ = Op::AddU;
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let f = self.relabelled_flat();
+        let five = self.s.m.i32(5);
+        let wave = self.s.m.bin(c, Bin::LShr, f, five);
+        let base = self.s.m.i32(self.s.lds_dwords);
+        let index = self.s.m.bin(c, Bin::Add, base, wave);
+        let lds = self.s.lds();
+        let here = self.s.m.element(c, lds, index);
+        self.s.m.store(c, here, partial);
+        let mode = self.s.m.i32(1 | 8);
+        let void = self.s.t.void;
+        self.s
+            .op(c, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        let one = self.s.m.i32(1);
+        let other_index = self.s.m.bin(c, Bin::Xor, index, one);
+        let there = self.s.m.element(c, lds, other_index);
+        let other = self.s.m.load(c, there);
+        // The slot can be written again by a later reduction once both
+        // halves have read it.
+        self.s
+            .op(c, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        // A last console wave of 32 threads or fewer has no other half (its
+        // lanes are the identity there), and neither has a group of 32.
+        let threads = self.s.threads.expect("compute");
+        let group = self.s.m.i32(threads.iter().product::<u32>());
+        let low = self.s.m.i32(!31u32);
+        let first = self.s.m.bin(c, Bin::And, f, low);
+        let k32 = self.s.m.i32(32);
+        let next = self.s.m.bin(c, Bin::Add, first, k32);
+        let has = self.s.m.cmp(c, pred::IULT, next, group);
+        let id = self.s.m.i32(ident);
+        let other = self.s.m.select(c, has, other, id);
+        let _ = i32t;
+        self.combine_pair(op, float, partial, other)
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
@@ -1296,6 +1488,16 @@ impl<'a> Lower<'a> {
             return Err(unsupported(0, why));
         }
         self.find_sections();
+        if self.halves && !self.one_host_wave() && self.sections_have_across() {
+            // One dword per host wave in the group: a reduction's halves
+            // are adjacent, so slot ^ 1 is the other half.
+            let group = self
+                .s
+                .threads
+                .map(|t| t.iter().product::<u32>())
+                .unwrap_or(0);
+            self.s.scratch_dwords = group.div_ceil(32).max(1) + 1;
+        }
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;

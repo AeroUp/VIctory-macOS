@@ -567,3 +567,43 @@ fn wave64_programs_in_halves_match_the_console_on_every_gpu() {
         )
     );
 }
+
+/// The console compiler's expansion of a wave64 sum: the identity into the
+/// inactive lanes, DPP rows of 8, the other 16-lane row, then lane 32's
+/// partial — hand-encoded after the pattern it emits.
+fn sum_of_64() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x7E14_0280, // v_mov_b32 v10, v0
+        0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
+        0xD501_0001,
+        0x0002_1480, // v_cndmask_b32 v1, 0, v10, s[0:1]
+        0x4A02_02E9,
+        0xDE54_C101, // v_add_nc_u32 v1, v1, v1 dpp8:[1,0,3,2,5,4,7,6]
+        0x4A02_02E9,
+        0x9360_1201, // v_add_nc_u32 v1, v1, v1 dpp8:[2,2,0,0,6,6,4,4]
+        0x4A02_02E9,
+        0x0009_2401, // v_add_nc_u32 v1, v1, v1 dpp8:[4,4,4,4,0,0,0,0]
+        0x4A02_02FA,
+        0xFF09_4001, // v_add_nc_u32 v1, v1, v1 row_mirror bound_ctrl:1
+        0xD778_0002,
+        0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+        0x4A02_0302, // v_add_nc_u32 v1, v2, v1
+        0xD760_0002,
+        0x0001_4101, // v_readlane_b32 s2, v1, 32
+        0x4A02_0202, // v_add_nc_u32 v1, s2, v1
+        0xD760_0029,
+        0x0001_0101, // v_readlane_b32 s41, v1, 0
+        0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+    ]);
+    w
+}
+
+/// A wave64 sum in halves: each host wave's partial in the scratch the
+/// halves exchange in, and a group of 32 (one host wave) needs no exchange.
+#[test]
+fn a_wave64_sum_translates_in_halves() {
+    let words = [sum_of_64(), store(1, 0).to_vec(), vec![S_ENDPGM]].concat();
+    assert_eq!(refusal(&words, 64, 0), "translated");
+    assert_eq!(refusal(&words, 32, 0), "translated");
+}
