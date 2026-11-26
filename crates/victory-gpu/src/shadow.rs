@@ -208,6 +208,13 @@ impl Shadow {
         self.tracked.as_ref().is_none_or(|t| t.is_dirty())
     }
 
+    /// Whether any page of `[from, to)` changed since it was taken: a
+    /// refresh of a range whose pages are all current copies nothing, and
+    /// a world frame asks for thousands of ranges.
+    pub(crate) fn dirty_between(&self, from: usize, to: usize) -> bool {
+        self.tracked.as_ref().is_none_or(|t| t.dirty_between(from, to))
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {

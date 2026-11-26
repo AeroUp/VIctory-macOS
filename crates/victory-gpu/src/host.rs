@@ -2103,7 +2103,7 @@ struct Batch {
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        if !shadow.is_dirty() {
+        if !shadow.is_dirty() || !shadow.dirty_between(address, address + len) {
             return;
         }
         let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);

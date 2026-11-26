@@ -450,6 +450,24 @@ impl Tracked {
         self.changed.2.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Whether any page of `[from, to)` changed since it was taken.
+    pub(crate) fn dirty_between(&self, from: usize, to: usize) -> bool {
+        if !self.changed.2.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        let (from, to) = (from.max(self.start), to.min(self.end));
+        if from >= to {
+            return false;
+        }
+        self.changed
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .range(from / PAGE..to.div_ceil(PAGE))
+            .next()
+            .is_some()
+    }
+
     /// Takes the changed pages of `[from, to)`: guards them (writes from
     /// now on mark them again) and returns the byte ranges to copy, cut to
     /// `[from, to)`, in order. A page whose part in the tracked memory lies
