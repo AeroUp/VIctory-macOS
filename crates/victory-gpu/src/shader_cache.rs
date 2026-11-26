@@ -311,6 +311,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        read_inputs,
         memory,
         memory_writes,
         view_addresses,
@@ -358,6 +359,10 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
     for slots in [root_cbvs, root_srvs, root_uavs] {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
+    }
+    word(&mut out, read_inputs.len() as u32);
+    for &k in read_inputs {
+        word(&mut out, k);
     }
     word(
         &mut out,
@@ -428,6 +433,11 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
+    let inputs = r.word()? as usize;
+    let mut read_inputs = Vec::with_capacity(inputs);
+    for _ in 0..inputs {
+        read_inputs.push(r.word()?);
+    }
     let memory = r.word()?;
     r.0.is_empty().then_some(Ok(HostShader {
         stage,
@@ -438,6 +448,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        read_inputs,
         memory: memory & 1 != 0,
         memory_writes: memory & 2 != 0,
         view_addresses: memory & 4 != 0,
@@ -471,6 +482,7 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             root_uavs: vec![4],
+            read_inputs: vec![1, 2],
             memory: true,
             memory_writes: true,
             view_addresses: true,

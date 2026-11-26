@@ -34,6 +34,8 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
+    /// Channels read (`1 << col`) of each input, by input id.
+    pub input_usage: Vec<u8>,
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
@@ -1364,7 +1366,9 @@ impl<'a> Lower<'a> {
         let memory_writes = self.s.memory_dirty.is_some();
         let view_addresses = self.s.view_addresses.is_some();
         let cmp_samplers = self.s.cmp_samplers;
+        let input_usage = self.s.inputs.iter().map(|e| e.usage).collect();
         Ok(Lowered {
+            input_usage,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -9740,12 +9744,7 @@ impl<'a> Lower<'a> {
                 &mut l.s.outputs
             }
         }
-        if stores
-            .iter()
-            .any(|s| s.3.is_none() && elements(self, primitive)[s.0].half)
-        {
-            return Err("a 16-bit output the stage data does not mark");
-        }
+
         // A mesh lane writes its own vertex or primitive, where it exports.
         let at = if mesh {
             self.begin_guarded(guard)
@@ -9766,6 +9765,18 @@ impl<'a> Lower<'a> {
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
             let native = elements(self, primitive)[id].comp == 8;
+            if native && half.is_none() {
+                // The signature was narrowed to fp16 (a mesh payload smaller
+                // than Metal's 32 KB limit) and the console exported 32-bit:
+                // convert, as the widened signature did the other way.
+                let c = self.cur;
+                let f = self.s.m.cast(c, Cast::Bitcast, x, self.s.t.f32);
+                let f16t = self.s.m.half();
+                let h = self.s.op(c, "f32tof16", Attr::ReadNone, f16t, 5, &[f]);
+                let i16 = self.s.m.int(16);
+                let bits = self.s.m.cast(c, Cast::Bitcast, h, i16);
+                x = self.s.m.cast(c, Cast::ZExt, bits, self.s.t.i32);
+            }
             if let Some(high) = half {
                 let c = self.cur;
                 if high {

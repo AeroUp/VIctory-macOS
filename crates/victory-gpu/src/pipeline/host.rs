@@ -583,7 +583,27 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
+            let bc = |t: &crate::pipeline::Translated| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: t.host.dxil.as_ptr().cast(),
+                BytecodeLength: t.host.dxil.len(),
+            };
+            // D3DMetal makes a no-op pipeline (logging an error) when the
+            // payload is too big, so prune before asking it to.
+            let estimate = victory_shader::emit::mesh_output_bytes(stages[0].0.bytes());
+            // Metal's own size is a few dozen bytes per vertex above the
+            // declared signature (a 248-byte signature is reported as 272+),
+            // so prune below the nominal limit: every observed failure sat
+            // in this margin (128 vertices).
+            let over_budget =
+                estimate.is_some_and(|n| n > victory_shader::emit::MESH_OUTPUT_LIMIT);
+            let parts = victory_shader::emit::mesh_output_parts(stages[0].0.bytes());
+            tracing::info!(?estimate, ?parts, over_budget, ?shaders, "mesh output size estimate");
+            let pruned = if over_budget { pruned_pair(&stages) } else { None };
+            let (ms_code, ps_code, made_name) = match &pruned {
+                Some((ms, ps)) => (bc(ms), bc(ps), format!("{name}-pruned")),
+                None => (code(0), code(1), name.clone()),
+            };
+            let pso = match mesh_pipeline(&host.device, &root, ms_code, ps_code, g, &made_name) {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -591,7 +611,11 @@ impl HostPipeline {
                     return None;
                 }
             };
-            tracing::info!(?shaders, "host mesh pipeline");
+            if pruned.is_some() {
+                tracing::info!(?shaders, "host mesh pipeline with pruned mesh outputs");
+            } else {
+                tracing::info!(?shaders, "host mesh pipeline");
+            }
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
@@ -704,6 +728,52 @@ fn host_topology(g: &GraphicsState) -> D3D12_PRIMITIVE_TOPOLOGY_TYPE {
 
 /// A mesh pipeline from the title's graphics state: the pipeline-state
 /// stream form (no input layout).
+/// A mesh/pixel pair translated with the mesh outputs (vertex and
+/// per-primitive) the pixel shader never declares removed, and that pixel
+/// shader's matching inputs with them, so the mesh payload fits Metal's
+/// 32 KB limit. `None` when nothing can be dropped.
+#[cfg(windows)]
+type MeshStages<'a> = [(&'a std::sync::Arc<crate::pipeline::Shader>, D3D12_SHADER_VISIBILITY)];
+
+#[cfg(windows)]
+fn pruned_pair(
+    stages: &MeshStages<'_>,
+) -> Option<(crate::pipeline::Translated, crate::pipeline::Translated)> {
+    use victory_shader::emit::{part_keys, prune_signatures};
+    use victory_shader::{FourCC, HwStage};
+    let (ms, _) = stages.first()?;
+    let (ps, _) = stages.get(1)?;
+    // Only the inputs its code actually loads: the signature declares every
+    // varying the console compiler kept, read or not.
+    let read = ps.translated()?.host.read_inputs.clone();
+    let mut cut: Vec<u32> = part_keys(ms.bytes(), FourCC::OSG1)
+        .ok()?
+        .into_iter()
+        .chain(part_keys(ms.bytes(), FourCC::PSG1).ok()?)
+        .filter(|k| k >> 24 == 0 && !read.contains(k))
+        .collect();
+    cut.sort_unstable();
+    cut.dedup();
+    tracing::info!(read = read.len(), cut = cut.len(), "mesh pair outputs");
+    if cut.is_empty() {
+        tracing::info!(
+            outputs = ?victory_shader::emit::signature_summary(ms.bytes(), victory_shader::FourCC::OSG1),
+            "mesh outputs with no unread element"
+        );
+    }
+    // Nothing to drop is fine: narrowing alone may fit.
+    let ms_pruned = prune_signatures(ms.bytes(), HwStage::Ms, &cut).ok()?;
+    let ps_pruned = prune_signatures(ps.bytes(), HwStage::Ps, &cut).ok()?;
+    // What the pixel shader reads all of is narrowed to fp16 instead: the
+    // payload halves, which fits where dropping nothing could not.
+    let ms_pruned = victory_shader::emit::narrow_signatures(&ms_pruned, HwStage::Ms).ok()?;
+    let ps_pruned = victory_shader::emit::narrow_signatures(&ps_pruned, HwStage::Ps).ok()?;
+    Some((
+        crate::pipeline::translate_from(&ms_pruned)?,
+        crate::pipeline::translate_from(&ps_pruned)?,
+    ))
+}
+
 fn mesh_pipeline(
     device: &ID3D12Device,
     root: &ID3D12RootSignature,

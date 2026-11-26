@@ -282,6 +282,9 @@ pub struct HostShader {
     pub stage: HwStage,
     /// The DXIL container, hashed as D3D12 expects.
     pub dxil: Vec<u8>,
+    /// Semantic keys ([`signature_keys`]) of the inputs whose channels the
+    /// code reads: a mesh output matching none can be dropped.
+    pub read_inputs: Vec<u32>,
     /// The user-data dwords the shader reads.
     pub user_data: Vec<UserData>,
     /// Immediate samplers: the four sampler words of `s<n>`.
@@ -546,9 +549,16 @@ pub fn emit_with(
         }
         l => l?,
     };
+    let read_inputs: Vec<u32> = inputs
+        .iter()
+        .zip(&l.input_usage)
+        .filter(|(_, used)| **used != 0)
+        .map(|(e, _)| key_of(e))
+        .collect();
     Ok(HostShader {
         stage: native.stage,
         dxil: l.dxil,
+        read_inputs,
         user_data: l.user_data,
         static_samplers: l
             .samplers
@@ -664,6 +674,164 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
         });
     }
     Ok(out)
+}
+
+/// The semantic keys (kind and index, packed) of a container's input or
+/// output signature: what a matching stage reads, or what this stage writes.
+pub fn signature_keys(container: &[u8], input: bool) -> Result<Vec<u32>, ShaderError> {
+    part_keys(container, if input { FourCC::ISG1 } else { FourCC::OSG1 })
+}
+
+/// [`signature_keys`] of one named signature part (`PSG1` for a mesh
+/// shader's per-primitive outputs).
+pub fn part_keys(container: &[u8], fourcc: FourCC) -> Result<Vec<u32>, ShaderError> {
+    let c = Container::parse(container)?;
+    let Some(part) = c.part(fourcc) else {
+        return Ok(Vec::new());
+    };
+    Ok(signature(part.data)?.iter().map(key_of).collect())
+}
+
+fn key_of(e: &container::SigElement) -> u32 {
+    (u32::from(e.kind) << 24) | (e.index & 0xFF_FFFF)
+}
+
+/// `(kind, comp, cols)` of each element in a signature part (diagnostics:
+/// what a mesh output costs and which elements can be narrowed).
+pub fn signature_summary(container: &[u8], fourcc: FourCC) -> Vec<(u8, u8, u8)> {
+    let Ok(c) = Container::parse(container) else {
+        return Vec::new();
+    };
+    let Some(part) = c.part(fourcc) else {
+        return Vec::new();
+    };
+    signature(part.data)
+        .map(|e| e.iter().map(|e| (e.kind, e.comp, e.cols)).collect())
+        .unwrap_or_default()
+}
+
+/// A copy of `container` whose user varyings (`kind == 0`, 32-bit floats)
+/// are declared native fp16: half the payload of a mesh whose outputs the
+/// pixel shader reads all of. Both stages of a pair must be narrowed.
+pub fn narrow_signatures(container: &[u8], stage: HwStage) -> Result<Vec<u8>, ShaderError> {
+    let c = Container::parse(container)?;
+    let mut parts: Vec<([u8; 4], Vec<u8>)> = Vec::with_capacity(c.parts.len());
+    for p in &c.parts {
+        let input = match (stage, p.fourcc) {
+            (HwStage::Ps, FourCC::ISG1) => Some(true),
+            (HwStage::Ms | HwStage::Vs, FourCC::OSG1) => Some(false),
+            (HwStage::Ms, FourCC::PSG1) => Some(false),
+            _ => None,
+        };
+        let mut data = p.data.to_vec();
+        if let Some(input) = input {
+            let mut elements = signature(p.data)?;
+            for e in &mut elements {
+                if e.kind == 0 && e.comp == 9 {
+                    e.comp = 8;
+                    e.half = true;
+                }
+            }
+            data = container::signature(&elements, input);
+        }
+        parts.push((p.fourcc.0, data));
+    }
+    let refs: Vec<(&[u8; 4], &[u8])> = parts.iter().map(|(f, d)| (f, d.as_slice())).collect();
+    Ok(container::build(&refs))
+}
+
+/// A stage's output payload stride as Metal lays it out (MSL struct rules):
+/// one field per signature element, aligned to its widest component, with
+/// `float3` padded to 16 bytes and no trailing padding.
+fn stride(elements: &[container::SigElement]) -> u64 {
+    let mut offset = 0u64;
+    for e in elements {
+        let cols = u64::from(e.cols.max(1));
+        let (size, align) = if e.half {
+            (cols * 2, (cols * 2).next_power_of_two().max(2))
+        } else {
+            match cols {
+                1 => (4, 4),
+                2 => (8, 8),
+                _ => (16, 16),
+            }
+        };
+        offset = offset.next_multiple_of(align) + size;
+    }
+    offset
+}
+
+/// The bytes a mesh shader's payload declares: its vertex outputs times
+/// its maximum vertices, plus its primitive outputs times its maximum
+/// primitives. Metal allows 32 KB (`MESH_OUTPUT_LIMIT`); a bigger pair is
+/// pruned before the host makes a no-op pipeline of it.
+pub fn mesh_output_bytes(container: &[u8]) -> Option<u64> {
+    let c = Container::parse(container).ok()?;
+    let part = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))?;
+    let programs = crate::native_programs(part.data).ok()?;
+    let ms = programs.iter().find(|p| matches!(p.stage, HwStage::Ms))?;
+    let crate::native::StageIo::Ms(mesh) = &ms.io else {
+        return None;
+    };
+    let vertex = stride(&signature(c.part(FourCC::OSG1)?.data).ok()?);
+    let primitive = c
+        .part(FourCC::PSG1)
+        .and_then(|p| signature(p.data).ok())
+        .map(|e| stride(&e))
+        .unwrap_or(0);
+    Some(vertex * u64::from(mesh.max_vertices) + primitive * u64::from(mesh.max_primitives))
+}
+
+/// [`mesh_output_bytes`]' parts: vertex bytes and maximum, then primitive
+/// bytes and maximum.
+pub fn mesh_output_parts(container: &[u8]) -> Option<(u64, u64, u64, u64)> {
+    let c = Container::parse(container).ok()?;
+    let part = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))?;
+    let programs = crate::native_programs(part.data).ok()?;
+    let ms = programs.iter().find(|p| matches!(p.stage, HwStage::Ms))?;
+    let crate::native::StageIo::Ms(mesh) = &ms.io else {
+        return None;
+    };
+    let vertex = stride(&signature(c.part(FourCC::OSG1)?.data).ok()?);
+    let primitive = c
+        .part(FourCC::PSG1)
+        .and_then(|p| signature(p.data).ok())
+        .map(|e| stride(&e))
+        .unwrap_or(0);
+    Some((vertex, u64::from(mesh.max_vertices), primitive, u64::from(mesh.max_primitives)))
+}
+
+/// Metal's largest mesh output payload.
+pub const MESH_OUTPUT_LIMIT: u64 = 32 * 1024;
+
+/// A copy of `container` whose signature drops the elements named in `cut`
+/// (packed keys): a mesh shader's outputs no paired pixel shader reads, and
+/// that pixel shader's matching inputs. Dropping them before lowering keeps
+/// the DXIL's output ids consistent with the signature, and the smaller
+/// signature fits Metal's 32 KB mesh output limit.
+pub fn prune_signatures(container: &[u8], stage: HwStage, cut: &[u32]) -> Result<Vec<u8>, ShaderError> {
+    if cut.is_empty() {
+        return Ok(container.to_vec());
+    }
+    let c = Container::parse(container)?;
+    let mut parts: Vec<([u8; 4], Vec<u8>)> = Vec::with_capacity(c.parts.len());
+    for p in &c.parts {
+        let input = match (stage, p.fourcc) {
+            (HwStage::Ps, FourCC::ISG1) => Some(true),
+            (HwStage::Ms | HwStage::Vs, FourCC::OSG1) => Some(false),
+            (HwStage::Ms, FourCC::PSG1) => Some(false),
+            _ => None,
+        };
+        let mut data = p.data.to_vec();
+        if input.is_some() {
+            let mut elements = signature(p.data)?;
+            elements.retain(|e| !cut.contains(&key_of(e)));
+            data = container::signature(&elements, input == Some(true));
+        }
+        parts.push((p.fourcc.0, data));
+    }
+    let refs: Vec<(&[u8; 4], &[u8])> = parts.iter().map(|(f, d)| (f, d.as_slice())).collect();
+    Ok(container::build(&refs))
 }
 
 #[cfg(test)]

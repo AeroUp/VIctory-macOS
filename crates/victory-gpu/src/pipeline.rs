@@ -97,6 +97,28 @@ impl Shader {
     }
 }
 
+impl Shader {
+    /// The container's bytes (the translated signatures are pruned from
+    /// them when a mesh colour pipeline is over Metal's output limit).
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.container
+    }
+}
+
+/// A translation of `container` made for one pipeline (not cached on the
+/// `Shader`): used for a mesh/pixel pair whose outputs were pruned.
+#[cfg(windows)]
+pub(crate) fn translate_from(container: &[u8]) -> Option<Translated> {
+    let (host, cached) = crate::shader_cache::host_shader(container);
+    match host.and_then(|host| with_resources(container, host)) {
+        Ok(translated) => Some(translated),
+        Err(error) => {
+            tracing::warn!(%error, cached, "a pruned or narrowed shader does not translate");
+            None
+        }
+    }
+}
+
 /// A translated shader and the console resources its code reads.
 #[cfg(windows)]
 pub(crate) struct Translated {
