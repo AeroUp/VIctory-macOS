@@ -1013,6 +1013,8 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
             // SAFETY: closed lists; the fence and event are ours.
+            #[cfg(feature = "diagnostics")]
+            #[cfg(feature = "diagnostics")]
             let submitting = std::time::Instant::now();
             unsafe {
                 self.queue.ExecuteCommandLists(group);
