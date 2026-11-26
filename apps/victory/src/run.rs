@@ -90,6 +90,18 @@ pub fn run(
         let n = victory_loader::masked::patch(image.base() as u64, &prepared.info, &original, wanted);
         println!("masked stores  {n} patched to plain stores");
     }
+    // On Series S the title picks FSR 4 (type 7), whose passes write nothing
+    // without host FidelityFX on a Mac (#172, fxceless/victory-fork#798).
+    // Patch the two chooser functions of build b99f876b... to return 6 (the
+    // title's own upscaler, as on Series X) when the expected bytes match.
+    if matches!(console, Console::SeriesS)
+        && std::env::var("VICTORY_PATCH_UPSCALER").map_or(true, |v| v != "0")
+    {
+        let n = patch_series_s_upscaler(image.base());
+        if n > 0 {
+            println!("upscaler       {n} Series S FSR4 chooser(s) patched to native (6)");
+        }
+    }
     let resolver = HleResolver::new(if strict {
         HostPolicy::none()
     } else {
@@ -559,6 +571,48 @@ mod tests {
         let expected_ok = true;
         assert_eq!(super::check_cpu_features().is_ok(), expected_ok);
     }
+}
+
+/// Patches the two Series S FSR 4 upscaler chooser functions of build
+/// `b99f876b...` to return 6 (the title's own upscaler, as on Series X) when
+/// the expected prologue bytes are present at those RVAs.
+#[cfg(windows)]
+fn patch_series_s_upscaler(base: usize) -> usize {
+    const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn VirtualProtect(
+            addr: *const std::ffi::c_void,
+            size: usize,
+            new_protect: u32,
+            old_protect: *mut u32,
+        ) -> i32;
+    }
+    const PATCHES: [(usize, [u8; 6]); 2] = [
+        (0x7e93f0, [0x48, 0x83, 0xec, 0x28, 0x80, 0x3d]),
+        (0x5400190, [0x48, 0x83, 0xec, 0x28, 0x48, 0x8b]),
+    ];
+    const RET6: [u8; 6] = [0xb8, 0x06, 0x00, 0x00, 0x00, 0xc3];
+    let mut patched = 0;
+    for (rva, expected) in PATCHES {
+        let ptr = (base + rva) as *mut u8;
+        // SAFETY: `base` is the mapped title image; we check the exact 6-byte
+        // prologue before making the page writable and restoring its protection.
+        unsafe {
+            let cur = std::slice::from_raw_parts(ptr, 6);
+            if cur != expected {
+                continue;
+            }
+            let mut old = 0;
+            if VirtualProtect(ptr.cast(), 6, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
+                std::ptr::copy_nonoverlapping(RET6.as_ptr(), ptr, 6);
+                let mut tmp = 0;
+                VirtualProtect(ptr.cast(), 6, old, &mut tmp);
+                patched += 1;
+            }
+        }
+    }
+    patched
 }
 
 #[cfg(test)]

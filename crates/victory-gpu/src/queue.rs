@@ -342,9 +342,7 @@ fn shown_plane(found: &[Vec<This>]) -> usize {
 }
 
 /// The plane to show given an override and each plane's first resource
-/// area (0 when unknown): the override when in range, else plane 0
-/// (on Series S plane 0 is the 1920x1080 3D picture and plane 1 is the
-/// 3840x2160 UI/subtitles overlay, which `composite` blends on top).
+/// area (0 when unknown): the override when in range, else the largest.
 #[cfg(any(windows, test))]
 fn pick_plane(want: Option<usize>, areas: &[u64]) -> usize {
     if let Some(w) = want
@@ -352,7 +350,13 @@ fn pick_plane(want: Option<usize>, areas: &[u64]) -> usize {
     {
         return w;
     }
-    0
+    let mut best = 0;
+    for (i, &a) in areas.iter().enumerate() {
+        if a > areas.get(best).copied().unwrap_or(0) {
+            best = i;
+        }
+    }
+    best
 }
 
 /// Shows the first resource of one plane in our window (the largest
@@ -615,13 +619,13 @@ mod tests {
     /// host.
     #[test]
     fn the_largest_plane_is_shown_unless_one_is_named() {
-        // Series S: plane 0 is the 1080p 3D picture, plane 1 the 4K UI overlay.
+        // Series S: a 1080p overlay, then the 4K picture.
         let series_s = [1920 * 1080, 3840 * 2160];
-        assert_eq!(pick_plane(None, &series_s), 0);
-        assert_eq!(pick_plane(Some(1), &series_s), 1);
-        // An override past the planes found falls back to plane 0.
-        assert_eq!(pick_plane(Some(5), &series_s), 0);
-        // Series X: one plane.
+        assert_eq!(pick_plane(None, &series_s), 1);
+        assert_eq!(pick_plane(Some(0), &series_s), 0);
+        // An override past the planes found falls back to the largest.
+        assert_eq!(pick_plane(Some(5), &series_s), 1);
+        // Series X: one plane. Ties and unknown sizes keep the first.
         assert_eq!(pick_plane(None, &[3840 * 2160]), 0);
         assert_eq!(pick_plane(None, &[0, 0]), 0);
         assert_eq!(pick_plane(None, &[100, 100]), 0);
