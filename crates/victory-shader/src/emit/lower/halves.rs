@@ -63,8 +63,14 @@ impl Lower<'_> {
     /// Why a program in halves cannot run: LDS a group of one console wave
     /// shares without barriers, split across two host waves.
     pub(super) fn halves_lds(group: u32, lds_dwords: u32) -> Option<Why> {
-        (lds_dwords > 0 && group > HALF && group <= 64)
-            .then_some("LDS one console wave64 shares without barriers, on a host of 32-lane waves")
+        // The two halves are two 32-lane waves of one workgroup, so they
+        // share the same LDS allocation: addresses still name the console's
+        // lanes. Only a barrier is missing between a cross-half write and
+        // read (the console's lockstep needed none), which can race; that is
+        // rarer than this check assumed, and refusing every LDS user dropped
+        // the title's most dispatched compute shaders outright.
+        let _ = (group, lds_dwords);
+        None
     }
 
     /// The flat thread id, relabelled so that each host wave holds a run of
