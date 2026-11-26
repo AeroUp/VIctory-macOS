@@ -1222,9 +1222,6 @@ impl<'a> Lower<'a> {
         // once, which `across_blocks` says.
         let across = self.halves && !self.one_host_wave();
         if across {
-            if prefix.is_some() {
-                return Err(ACROSS);
-            }
             let block = self.cur_ir;
             let uniform = self.across_blocks()[block];
             if !uniform {
@@ -1252,7 +1249,11 @@ impl<'a> Lower<'a> {
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
             (Op::AddU | Op::AddF, Some(inclusive)) => {
-                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
+                // In halves the exchange adds the lower half's total, so the
+                // host op is the exclusive prefix and the lane's own value is
+                // added here when the console's includes it (see
+                // [`Lower::across_prefix`]).
+                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(if across { 0 } else { 1 }));
                 let r = self.s.op(
                     c,
                     &format!("wavePrefixOp.{sfx}"),
@@ -1261,7 +1262,7 @@ impl<'a> Lower<'a> {
                     121,
                     &[arg, k0, k1],
                 );
-                if inclusive {
+                if inclusive && !across {
                     self.s.m.bin(c, Bin::Add, r, arg)
                 } else {
                     r
@@ -1297,11 +1298,19 @@ impl<'a> Lower<'a> {
                 )
             }
         };
-        let r = if float { self.as_int(r) } else { r };
         if across {
-            return Ok(self.across_reduce(r, ident, op, float));
+            return Ok(match prefix {
+                Some(inclusive) => {
+                    let lifted = self.across_prefix(r, arg, float, inclusive);
+                    if float { self.as_int(lifted) } else { lifted }
+                }
+                None => {
+                    let r = if float { self.as_int(r) } else { r };
+                    self.across_reduce(r, ident, op, float)
+                }
+            });
         }
-        Ok(r)
+        Ok(if float { self.as_int(r) } else { r })
     }
 
     /// The blocks every thread of the group runs exactly once: a barrier
@@ -1418,11 +1427,27 @@ impl<'a> Lower<'a> {
     /// in the group (the two halves of a console wave are adjacent), and a
     /// wave whose other half does not exist (a group of 32 thread run as
     /// one) reads the identity.
-    fn across_reduce(&mut self, partial: V, ident: u32, op: super::wave::Op, float: bool) -> V {
-        use super::wave::Op;
-        let _ = Op::AddU;
+    /// Whether this host wave is the lower half of its console wave.
+    fn in_low_half(&mut self) -> V {
         let c = self.cur;
-        let i32t = self.s.t.i32;
+        let f = self.relabelled_flat();
+        let one = self.s.m.i32(1);
+        let five = self.s.m.i32(5);
+        let shifted = self.s.m.bin(c, Bin::LShr, f, five);
+        let half = self.s.m.bin(c, Bin::And, shifted, one);
+        let zero = self.s.m.i32(0);
+        self.s.m.cmp(c, pred::EQ, half, zero)
+    }
+
+    /// Exchanges `value` — one dword, the same in every lane of a host wave
+    /// — with the other half of the console wave, through `value`'s dword
+    /// of the scratch reserved past the console's shared memory at this
+    /// host wave's index in the group (the halves of a console wave are
+    /// adjacent). `missing` stands in when the other half does not exist (a
+    /// last console wave of 32 threads or fewer). Two barriers: one after
+    /// writing, one after reading, so a later exchange can use the slot.
+    fn across_exchange(&mut self, value: V, missing: V) -> V {
+        let c = self.cur;
         let f = self.relabelled_flat();
         let five = self.s.m.i32(5);
         let wave = self.s.m.bin(c, Bin::LShr, f, five);
@@ -1430,21 +1455,18 @@ impl<'a> Lower<'a> {
         let index = self.s.m.bin(c, Bin::Add, base, wave);
         let lds = self.s.lds();
         let here = self.s.m.element(c, lds, index);
-        self.s.m.store(c, here, partial);
+        self.s.m.store(c, here, value);
         let mode = self.s.m.i32(1 | 8);
         let void = self.s.t.void;
-        self.s
-            .op(c, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        self.s.op(c, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         let one = self.s.m.i32(1);
         let other_index = self.s.m.bin(c, Bin::Xor, index, one);
         let there = self.s.m.element(c, lds, other_index);
         let other = self.s.m.load(c, there);
-        // The slot can be written again by a later reduction once both
-        // halves have read it.
-        self.s
-            .op(c, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
-        // A last console wave of 32 threads or fewer has no other half (its
-        // lanes are the identity there), and neither has a group of 32.
+        self.s.op(c, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        // The console's last wave may have fewer than 64 threads: its upper
+        // half does not exist, and neither has the upper half of a group of
+        // 32.
         let threads = self.s.threads.expect("compute");
         let group = self.s.m.i32(threads.iter().product::<u32>());
         let low = self.s.m.i32(!31u32);
@@ -1452,10 +1474,70 @@ impl<'a> Lower<'a> {
         let k32 = self.s.m.i32(32);
         let next = self.s.m.bin(c, Bin::Add, first, k32);
         let has = self.s.m.cmp(c, pred::IULT, next, group);
+        self.s.m.select(c, has, other, missing)
+    }
+
+    /// A reduction's value over both 32-lane halves of the console wave: this
+    /// host wave's partial, the other half's, combined.
+    fn across_reduce(&mut self, partial: V, ident: u32, op: super::wave::Op, float: bool) -> V {
         let id = self.s.m.i32(ident);
-        let other = self.s.m.select(c, has, other, id);
-        let _ = i32t;
+        let other = self.across_exchange(partial, id);
         self.combine_pair(op, float, partial, other)
+    }
+
+    /// A prefix sum's value over both 32-lane halves: the lane's prefix in
+    /// its own half, lifted by the other half's total when it is in the
+    /// upper one.
+    fn across_prefix(&mut self, r: V, arg: V, float: bool, inclusive: bool) -> V {
+        let c = self.cur;
+        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let ty = if float { f32t } else { i32t };
+        let (sum, signed) = (self.s.m.i8(0), self.s.m.i8(0));
+        let sfx = if float { "f32" } else { "i32" };
+        let total = self.s.op(
+            c,
+            &format!("waveActiveOp.{sfx}"),
+            Attr::NoUnwind,
+            ty,
+            119,
+            &[arg, sum, signed],
+        );
+        let zero = if float {
+            self.s.m.f32(0)
+        } else {
+            self.s.m.i32(0)
+        };
+        let other = self.across_exchange(total, zero);
+        let low = self.in_low_half();
+        let start = self.s.m.select(c, low, zero, other);
+        // The lane's own value first (the console's inclusive prefix), then
+        // the lower half's total for the upper half's lanes.
+        let r = if inclusive {
+            self.s.m.bin(c, Bin::Add, r, arg)
+        } else {
+            r
+        };
+        self.s.m.bin(c, Bin::Add, r, start)
+    }
+
+    /// Both 32-bit words of a 64-lane ballot, in halves: this host wave's
+    /// lanes' bits in the word its half owns, and the other half's from the
+    /// exchange. 0 for a half that does not exist.
+    fn across_ballot(&mut self, bit: V, at: usize) -> (V, V) {
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self
+            .s
+            .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        let own = self.s.m.extract(at, r, 0);
+        let zero = self.s.m.i32(0);
+        let other = self.across_exchange(own, zero);
+        let low = self.in_low_half();
+        let c = self.cur;
+        let lo = self.s.m.select(c, low, own, other);
+        let hi = self.s.m.select(c, low, other, own);
+        (lo, hi)
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
@@ -2088,25 +2170,42 @@ impl<'a> Lower<'a> {
                     Some(&b) if b == self.cur_ir => self.cur,
                     Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
-                self.same_half("a lane mask read as data (wave64 on a 32-lane host)")?;
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
                 }
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
                 let bit = bit?;
-                let i32t = self.s.t.i32;
-                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                let r = self
-                    .s
-                    .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
-                self.s.flags |= flags::WAVE_OPS;
-                let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                let xy = self.ballot_words(bit, at)?;
                 self.ballots.insert(lo, xy);
                 xy
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// Both words of the 64-lane ballot of `bit`, the ballot emitted in
+    /// `at`. In halves each host wave ballots its own lanes and the other
+    /// half's word comes from the scratch; the block must be one every
+    /// thread of the group runs (the exchange barriers).
+    fn ballot_words(&mut self, bit: V, at: usize) -> Result<(V, V), Why> {
+        if self.halves && !self.one_host_wave() {
+            let block = self.cur_ir;
+            let uniform = self.across_blocks()[block];
+            if !uniform {
+                return Err(
+                    "a lane mask read as data in control flow that not every thread of the group runs (a cross-half exchange needs a barrier there)",
+                );
+            }
+            return Ok(self.across_ballot(bit, at));
+        }
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self
+            .s
+            .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        Ok((self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1)))
     }
 
     /// Ballot of a per-lane bit written into an SGPR that `st.masks` did not track.
@@ -2119,13 +2218,7 @@ impl<'a> Lower<'a> {
                     Some(&b) if b == self.cur_ir => self.cur,
                     Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
-                let i32t = self.s.t.i32;
-                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                let r = self
-                    .s
-                    .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
-                self.s.flags |= flags::WAVE_OPS;
-                let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                let xy = self.ballot_words(bit, at)?;
                 self.ballots.insert(lo, xy);
                 xy
             }
