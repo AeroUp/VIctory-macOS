@@ -2758,7 +2758,7 @@ impl Meter {
         let indirect = crate::list::take_indirect() as f64 / frames;
         // Of a frame, ms in the title's draw calls (diagnostics builds).
         #[cfg(feature = "diagnostics")]
-        let [record_ms, prepare_ms, bind_ms, record_calls, dispatch_ms, dispatch_calls, tables_ms, values_ms, roots_ms, heap_ms, memory_ms, table_entries, entry_ms, mirror_ms, readable_ms, mirror_calls, mirror_hits, title_records] = {
+        let [record_ms, prepare_ms, bind_ms, record_calls, dispatch_ms, dispatch_calls, tables_ms, values_ms, roots_ms, heap_ms, memory_ms, table_entries, entry_ms, mirror_ms, readable_ms, mirror_calls, mirror_hits, title_records, makes] = {
             let [
                 us,
                 prep,
@@ -2778,6 +2778,7 @@ impl Meter {
                 mirrors,
                 hits,
                 records,
+                makes,
             ] = crate::draw::take_record();
             [
                 us as f64 / 1e3 / frames,
@@ -2798,6 +2799,7 @@ impl Meter {
                 mirrors as f64 / frames,
                 hits as f64 / frames,
                 records as f64 / frames,
+                makes as f64 / frames,
             ]
         };
         let root_views = crate::draw::take_root_view_slots() as f64 / frames;
@@ -2819,7 +2821,7 @@ impl Meter {
                     #[cfg(feature = "diagnostics")]
                     {
                         format!(
-                            "; {record_ms:.1} in {record_calls:.0} draw calls ({prepare_ms:.1} preparing them), {bind_ms:.1} binding (tables {tables_ms:.1}: {table_entries:.0} entries, {entry_ms:.1} in them, {mirror_ms:.1} mirroring {mirror_calls:.0} ({mirror_hits:.0} hits), {readable_ms:.1} readable; {title_records:.0} title descriptor writes; values {values_ms:.1}, roots {roots_ms:.1}, heap {heap_ms:.1}, memory {memory_ms:.1}), {dispatch_ms:.1} in {dispatch_calls:.0} dispatches"
+                            "; {record_ms:.1} in {record_calls:.0} draw calls ({prepare_ms:.1} preparing them), {bind_ms:.1} binding (tables {tables_ms:.1}: {table_entries:.0} entries, {entry_ms:.1} in them, {mirror_ms:.1} mirroring {mirror_calls:.0} ({mirror_hits:.0} hits), {readable_ms:.1} readable; {title_records:.0} title descriptor writes, {makes:.0} host slots made; values {values_ms:.1}, roots {roots_ms:.1}, heap {heap_ms:.1}, memory {memory_ms:.1}), {dispatch_ms:.1} in {dispatch_calls:.0} dispatches"
                         )
                     }
                     #[cfg(not(feature = "diagnostics"))]

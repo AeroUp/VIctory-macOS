@@ -24,7 +24,15 @@ pub(crate) struct HostHeap {
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
-    made: Mutex<Vec<u64>>,
+    /// Read-mostly: a world frame finds most slots unchanged, from several
+    /// recording threads at once.
+    made: std::sync::RwLock<Vec<u64>>,
+    /// One slot made from each record (as `made` keys them): a record the
+    /// title copies into many slots is made once, and each further slot gets
+    /// the host descriptor copied, not the view made again (the driver's
+    /// view creation costs microseconds, and a world frame copies tens of
+    /// thousands of descriptors to build each draw's table).
+    canonical: Mutex<std::collections::HashMap<u64, u32>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -213,7 +221,8 @@ impl HostHeap {
             count,
             dynamic: extra,
             sampler,
-            made: Mutex::new(vec![0; count as usize]),
+            made: std::sync::RwLock::new(vec![0; count as usize]),
+            canonical: Mutex::new(std::collections::HashMap::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
@@ -573,7 +582,7 @@ impl HostHeap {
             let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 16)?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
-            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            let made = self.made.read().unwrap_or_else(|e| e.into_inner());
             for (i, &key) in made.iter().enumerate() {
                 let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
                 write_address(data, i, view.as_ref());
@@ -660,6 +669,128 @@ impl HostHeap {
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
+    /// The title copied `count` descriptors from `from_handle` to
+    /// `to_handle` (both in this heap; it has already copied the bytes).
+    /// Slots whose source is made from the record the title copied get the
+    /// source's host descriptor copied over, in runs: making a view again
+    /// costs the driver microseconds, and a world frame copies thousands of
+    /// descriptors to build each draw's table.
+    pub(crate) fn copy_slots(
+        &self,
+        from: u32,
+        from_handle: u64,
+        to: u32,
+        to_handle: u64,
+        count: u32,
+        kind: i32,
+    ) {
+        let Some(host) = host() else { return };
+        let kind = windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_HEAP_TYPE(kind);
+        let step = u64::from(self.step);
+        let mut k = 0;
+        while k < count {
+            // A run of slots whose source is made from the record the title
+            // copied, and which are not waiting for their heap's first draw.
+            let mut run = 0;
+            {
+                let made = self.made.read().unwrap_or_else(|e| e.into_inner());
+                while k + run < count {
+                    let s = from + k + run;
+                    // A slot waiting to be made has no record (`made` 0).
+                    if s >= self.count || made[s as usize] == 0 {
+                        break;
+                    }
+                    // The source slot must be made from the record it holds
+                    // now, which is the one the title copied to the other.
+                    // SAFETY: a descriptor slot of the title's heap.
+                    let [tag, i, generation] =
+                        unsafe { ((from_handle + u64::from(k + run) * step) as *const [u32; 3]).read_unaligned() };
+                    let key = u64::from(generation) << 32 | u64::from(i);
+                    if tag != crate::descriptor::VIEW_TAG || made[s as usize] != key {
+                        break;
+                    }
+                    run += 1;
+                }
+            }
+            if run == 0 {
+                let index = to + k;
+                if index < self.count {
+                    self.mirror(index, to_handle + u64::from(k) * step, false);
+                }
+                k += 1;
+                continue;
+            }
+            // SAFETY: slots of our heap, which outlives the call.
+            unsafe {
+                host.device.CopyDescriptorsSimple(
+                    run,
+                    self.cpu(to + k),
+                    self.cpu(from + k),
+                    kind,
+                );
+            }
+            let mut made = self.made.write().unwrap_or_else(|e| e.into_inner());
+            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+            for j in 0..run {
+                let (s, d) = ((from + k + j) as usize, (to + k + j) as usize);
+                made[d] = made[s];
+                kept[d] = kept[s].clone();
+                deferred.remove(&(to + k + j));
+                self.copy_slot_tables(s as u32, d as u32);
+                let key = made[s];
+                if let Some(view) = view_at(key as u32, (key >> 32) as u32) {
+                    self.viewed.set(d as u32, Some(&view), kept[d].is_some());
+                }
+            }
+            k += run;
+        }
+    }
+
+    /// This heap's kind, for copying a descriptor in it.
+    fn kind(&self) -> windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_HEAP_TYPE {
+        windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_HEAP_TYPE(if self.sampler {
+            1
+        } else {
+            0
+        })
+    }
+
+    /// Copies what slot `from` tells shaders about its view to slot `to`:
+    /// its stride (buffer views), its write mark (unordered ones) and its
+    /// address (title memory).
+    fn copy_slot_tables(&self, from: u32, to: u32) {
+        let limit = self.count.max(victory_shader::emit::HEAP_VIEWS);
+        if from >= limit || to >= limit {
+            return;
+        }
+        if let Some((_, data)) = &self.strides {
+            // SAFETY: a dword per slot of the mapped table.
+            unsafe {
+                let at = *data as *mut u32;
+                at.add(to as usize).write_volatile(at.add(from as usize).read_volatile());
+            }
+        }
+        if let Some((_, data)) = &self.marks {
+            // SAFETY: two dwords per slot of the mapped table.
+            unsafe {
+                let at = *data as *mut u32;
+                for i in 0..2 {
+                    let (f, t) = (2 * from as usize + i, 2 * to as usize + i);
+                    at.add(t).write_volatile(at.add(f).read_volatile());
+                }
+            }
+        }
+        if let Some(Some((_, data, _))) = self.addresses.get() {
+            // SAFETY: 16 bytes per title slot of the mapped table.
+            unsafe {
+                let at = *data as *const [u32; 4];
+                let words = at.add(from as usize).read_unaligned();
+                (*data as *mut [u32; 4]).add(to as usize).write_unaligned(words);
+            }
+        }
+    }
+
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
@@ -679,7 +810,20 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        // Unchanged since this slot was made: the same view, without taking
+        // the lock alone (recording threads ask at once).
+        let unchanged = self
+            .made
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)
+            .is_some_and(|&made| made == key);
+        if unchanged
+            && let Some(view) = view_at(i, generation)
+        {
+            return Some(view);
+        }
+        let mut made = self.made.write().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
@@ -724,6 +868,46 @@ impl HostHeap {
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
             made[index as usize] = key;
+            // A record already made in this heap: copy that host descriptor
+            // instead of making the view again. The title builds each draw's
+            // table by copying descriptors, and a view costs the driver
+            // microseconds to make: a world frame makes tens of thousands.
+            let canonical = {
+                let mut map = self.canonical.lock().unwrap_or_else(|e| e.into_inner());
+                match map.get(&key).copied() {
+                    Some(c) if c != index && made.get(c as usize) == Some(&key) => Some(c),
+                    _ => {
+                        map.insert(key, index);
+                        None
+                    }
+                }
+            };
+            if let Some(c) = canonical
+                && let Some(host) = host()
+            {
+                // SAFETY: slots of our heap, which outlives the call.
+                unsafe {
+                    host.device
+                        .CopyDescriptorsSimple(1, self.cpu(index), self.cpu(c), self.kind())
+                };
+                self.copy_slot_tables(c, index);
+                let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+                if let (Some(src), Some(dst)) =
+                    (kept.get(c as usize).cloned(), kept.get_mut(index as usize))
+                {
+                    *dst = src;
+                    if !self.sampler {
+                        self.viewed.set(index, Some(&view), dst.is_some());
+                    }
+                }
+                self.deferred
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&index);
+                return Some(view);
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::draw::RECORD[18].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let (kept, mark) = make_marked(&view, self.cpu(index));
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
@@ -782,7 +966,11 @@ impl HostHeap {
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
+        let key = *self
+            .made
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)?;
         // A view the host could not make leaves a null view, its record
         // noted all the same; it keeps no resource.
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(Option::is_some);
@@ -801,7 +989,7 @@ impl HostHeap {
     /// Whether slot `index` was made from a record (tests).
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {
-        self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] != 0
+        self.made.read().unwrap_or_else(|e| e.into_inner())[index as usize] != 0
     }
 }
 

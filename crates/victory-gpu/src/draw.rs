@@ -157,8 +157,9 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// views, the heap path, view addresses and title memory, then the table
 /// entries walked, their time, mirroring and making them readable.
 #[cfg(feature = "diagnostics")]
-pub(crate) static RECORD: [AtomicU64; 18] = [
+pub(crate) static RECORD: [AtomicU64; 19] = [
 AtomicU64::new(0),
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -180,8 +181,8 @@ AtomicU64::new(0),
 
 /// [`RECORD`] since the last call.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn take_record() -> [u64; 18] {
-    let mut out = [0u64; 18];
+pub(crate) fn take_record() -> [u64; 19] {
+    let mut out = [0u64; 19];
     for (i, slot) in out.iter_mut().enumerate() {
         *slot = RECORD[i].swap(0, Ordering::Relaxed);
     }

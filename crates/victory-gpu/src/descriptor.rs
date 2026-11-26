@@ -381,8 +381,6 @@ pub(crate) enum View {
 /// views, samplers) are kept for the run; they are bounded by the title's
 /// memory and sampler states.
 struct Views {
-    /// Each entry's view and generation.
-    list: Vec<(View, u32)>,
     index: std::collections::BTreeMap<View, u32>,
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
@@ -390,12 +388,16 @@ struct Views {
 }
 
 static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
-    list: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
 });
-const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
+
+/// The entries themselves, in [`Views`]' own lock's shadow: a world frame
+/// asks for thousands of descriptors per draw while a view is made once, so
+/// readers share this lock and never wait for the index's.
+static LIST: std::sync::RwLock<Vec<(View, u32)>> = std::sync::RwLock::new(Vec::new());
+pub(crate) const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 impl View {
     /// The resource objects the view names.
@@ -416,16 +418,18 @@ fn record(handle: u64, view: View) {
     let i = match views.index.get(&view) {
         Some(&i) => i,
         None => {
+            let mut list = LIST.write().unwrap_or_else(|e| e.into_inner());
             let i = match views.free.pop() {
                 Some(i) => {
-                    views.list[i as usize].0 = view.clone();
+                    list[i as usize].0 = view.clone();
                     i
                 }
                 None => {
-                    views.list.push((view.clone(), 1));
-                    views.list.len() as u32 - 1
+                    list.push((view.clone(), 1));
+                    list.len() as u32 - 1
                 }
             };
+            drop(list);
             for r in view.resources().into_iter().filter(|&r| r != 0) {
                 views.by_resource.entry(r).or_default().push(i);
             }
@@ -433,7 +437,7 @@ fn record(handle: u64, view: View) {
             i
         }
     };
-    let generation = views.list[i as usize].1;
+    let generation = LIST.read().unwrap_or_else(|e| e.into_inner())[i as usize].1;
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
     drop(views);
@@ -447,15 +451,16 @@ pub(crate) fn forget(resource: usize) {
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
+    let mut list = LIST.write().unwrap_or_else(|e| e.into_inner());
     for i in entries {
-        let (view, generation) = views.list[i as usize].clone();
+        let (view, generation) = list[i as usize].clone();
         // Entries freed through a view's other resource may hold another
         // view by now.
         if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
             continue;
         }
         views.index.remove(&view);
-        views.list[i as usize].1 = generation.wrapping_add(1).max(1);
+        list[i as usize].1 = generation.wrapping_add(1).max(1);
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
@@ -465,9 +470,12 @@ pub(crate) fn forget(resource: usize) {
 /// The view of entry `i` if `generation` is still its own.
 #[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (*current == generation).then(|| view.clone())
+    let entry = LIST
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(i as usize)
+        .cloned();
+    entry.and_then(|(view, current)| (current == generation).then_some(view))
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
@@ -477,9 +485,10 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (tag == VIEW_TAG && *current == generation).then(|| view.clone())
+    if tag != VIEW_TAG {
+        return None;
+    }
+    view_at(i, generation)
 }
 
 /// A description of `N` words, if the title passes one.
@@ -567,8 +576,37 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         // SAFETY: both ranges are descriptor slots the title owns.
         unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
         #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
+        {
+            // Both in one shader-visible heap: the host descriptors of the
+            // source slots are copied too where they are made from the
+            // records the title copied, so a table the title builds by
+            // copying is not made view by view again (creating a host view
+            // costs the driver microseconds, a world frame copies thousands).
+            let copied = {
+                // Held across the copy, as `mirror` holds it: `Heap::drop`
+                // takes it, so the heap cannot go meanwhile.
+                let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+                let hold = heaps
+                    .iter()
+                    .find(|&&(start, end, _)| (start..end).contains(&dst))
+                    .filter(|&&(start, end, _)| (start..end).contains(&src))
+                    .copied();
+                hold.map(|(_, _, at)| {
+                    // SAFETY: as above.
+                    let heap = unsafe { &*(at as *const Heap) };
+                    let (Some(host), Some(from), Some(to)) =
+                        (heap.host(), heap.index(src), heap.index(dst))
+                    else {
+                        return;
+                    };
+                    host.copy_slots(from, src, to, dst, count, kind as i32);
+                })
+            };
+            if copied.is_none() {
+                for i in 0..u64::from(count) {
+                    mirror(dst + i * step);
+                }
+            }
         }
     }
 }
