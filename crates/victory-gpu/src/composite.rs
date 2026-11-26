@@ -16,10 +16,10 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::{Result, s};
 
-/// Whether `VICTORY_PRESENT_COMPOSITE=1` asks for the pass.
+/// Whether compositing is enabled (default on; `VICTORY_PRESENT_COMPOSITE=0` turns it off).
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_PRESENT_COMPOSITE").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("VICTORY_PRESENT_COMPOSITE").map_or(true, |v| v != "0"))
 }
 
 const SOURCE: &str = r#"

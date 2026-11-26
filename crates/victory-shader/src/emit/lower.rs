@@ -5539,6 +5539,19 @@ impl<'a> Lower<'a> {
             self.lane(inst, Some(true));
             return Ok(());
         }
+        // One lane of a VGPR a whole-wave section left.
+        if name == "v_readlane_b32"
+            && let Some(&(_, w)) = inst.writes.first()
+            && let Some(sh) = self.sections.get(&b).and_then(|s| {
+                s.iter()
+                    .filter(|s| s.1.end < i)
+                    .find_map(|s| s.1.reads.get(&w).copied())
+            })
+        {
+            let x = self.shape(sh)?;
+            self.vals.insert(w, Val::I32(x));
+            return Ok(());
+        }
         if let Some(rest) = name.strip_prefix("v_cmp_").or(name.strip_prefix("v_cmpx_")) {
             let r = if v.dpp.is_some() {
                 Err("a compare with DPP")

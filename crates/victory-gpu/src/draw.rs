@@ -64,6 +64,9 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    /// The render target views and depth view the host list has (`set_targets`):
+    /// per view, the host texture pointer and `RtvRecord::key`.
+    host_targets: Option<(Vec<(usize, (usize, [u32; 7]))>, Option<(usize, (usize, [u32; 7]))>)>,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
     /// What the host list has: pipeline, root signature, heaps.
@@ -326,13 +329,15 @@ impl State {
         self.index = view.copied().unwrap_or_default();
     }
 
-    /// Render targets and depth, set on the host list at once.
+    /// Render targets and depth, set on the host list at once unless it has
+    /// the same ones already.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
         let Some(host) = crate::host::host() else {
             return;
         };
         self.targets.clear();
-        let mut rtvs = Vec::new();
+        let mut views = Vec::with_capacity(handles.len());
+        let mut keys = Vec::with_capacity(handles.len());
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -347,16 +352,31 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+            keys.push((texture.as_raw() as usize, record.key()));
+            views.push((texture, record.desc()));
         }
         self.depth = 0;
-        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
+        let depth_view = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            let key = (texture.as_raw() as usize, record.key());
+            Some((key, texture, record.depth_desc()))
         });
+        let depth_key = depth_view.as_ref().map(|(k, _, _)| *k);
+        if let Some((ref cur_rtvs, cur_dsv)) = self.host_targets
+            && *cur_rtvs == keys
+            && cur_dsv == depth_key
+        {
+            return;
+        }
+        self.host_targets = Some((keys, depth_key));
+        let rtvs: Vec<_> = views
+            .iter()
+            .map(|(t, d)| host.rtv(t.clone(), d.as_ref()))
+            .collect();
+        let dsv = depth_view.map(|(_, t, d)| host.dsv(t, d.as_ref()));
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -549,10 +569,8 @@ impl State {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
         #[cfg(feature = "diagnostics")]
         crate::capture::binding(&p.name);
