@@ -1457,6 +1457,21 @@ impl State {
         out
     }
 
+    /// Whether the bound targets are depth-only (a shadow or depth prepass).
+    fn depth_only_targets(&self) -> bool {
+        self.host_targets
+            .as_ref()
+            .is_some_and(|(colours, depth)| colours.is_empty() && depth.is_some())
+    }
+
+    /// `VICTORY_SKIP_DEPTH_DRAWS`: do not issue a depth-only draw (its
+    /// state is still prepared). For timing what the shadow passes cost.
+    fn skip_depth_draw(&self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        self.depth_only_targets()
+            && *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_DEPTH_DRAWS").is_some())
+    }
+
     pub(crate) fn draw(
         &mut self,
         list: &HostList,
@@ -1486,11 +1501,19 @@ impl State {
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
             #[cfg(feature = "diagnostics")]
             self.probe_small(list, false);
-            // SAFETY: an open list with everything set.
-            unsafe {
-                list.list
-                    .DrawInstanced(count, instances, from, first_instance)
-            };
+            if self.skip_depth_draw() {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n % 4000 == 0 {
+                    tracing::info!(n, "depth-only draws skipped");
+                }
+            } else {
+                // SAFETY: an open list with everything set.
+                unsafe {
+                    list.list
+                        .DrawInstanced(count, instances, from, first_instance)
+                };
+            }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1580,11 +1603,19 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
-            // SAFETY: an open list with everything set.
-            unsafe {
-                list.list
-                    .DrawIndexedInstanced(indices, instances, first, base, first_instance)
-            };
+            if self.skip_depth_draw() {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n % 4000 == 0 {
+                    tracing::info!(n, "depth-only indexed draws skipped");
+                }
+            } else {
+                // SAFETY: an open list with everything set.
+                unsafe {
+                    list.list
+                        .DrawIndexedInstanced(indices, instances, first, base, first_instance)
+                };
+            }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
