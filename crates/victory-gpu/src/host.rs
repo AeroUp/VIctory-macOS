@@ -97,8 +97,13 @@ unsafe impl Sync for Host {}
 
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
-/// detiling), then waiting for the GPU.
-static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] = [
+/// detiling), then submitting and waiting for the GPU; and of that, the
+/// part inside `ExecuteCommandLists` and the fence's setup (the host's
+/// translation, under D3DMetal about ten microseconds a call) and the part
+/// waiting for the fence.
+static SUBMISSION_US: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
 ];
@@ -1008,16 +1013,23 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
             // SAFETY: closed lists; the fence and event are ours.
+            let submitting = std::time::Instant::now();
             unsafe {
                 self.queue.ExecuteCommandLists(group);
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                #[cfg(feature = "diagnostics")]
+                SUBMISSION_US[2]
+                    .fetch_add(submitting.elapsed().as_micros() as u64, Ordering::Relaxed);
+                let waiting = std::time::Instant::now();
                 match waited {
                     Ok(()) => self.wait_for(*submitted),
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
+                #[cfg(feature = "diagnostics")]
+                SUBMISSION_US[3].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
@@ -2748,6 +2760,10 @@ impl Meter {
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] =
             [0, 1].map(|i| SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+        // Of the GPU's time, the host's own translation and the fence wait.
+        #[cfg(feature = "diagnostics")]
+        let [submit_ms, wait_ms] =
+            [2, 3].map(|i| SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
@@ -2810,11 +2826,21 @@ impl Meter {
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
-                 GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
+                 GPU{gpu_split}; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame \
                  ({null_views:.0} null views bound){recording}",
                 making = crate::pipeline::making(),
+                gpu_split = {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        format!(" ({submit_ms:.1} submitting, {wait_ms:.1} waiting)")
+                    }
+                    #[cfg(not(feature = "diagnostics"))]
+                    {
+                        String::new()
+                    }
+                },
                 recording = {
                     #[cfg(feature = "diagnostics")]
                     {
