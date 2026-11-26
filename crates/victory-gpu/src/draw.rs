@@ -151,6 +151,62 @@ pub(crate) fn take_dropped() -> u64 {
 }
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Time in the title's draw calls (diagnostics builds): all of them, in
+/// [`State::prepare_for`], in [`State::bind`], their count, all dispatches
+/// and their count, then the parts of binding: tables, user data, root
+/// views, the heap path, view addresses and title memory, then the table
+/// entries walked, their time, mirroring and making them readable.
+#[cfg(feature = "diagnostics")]
+pub(crate) static RECORD: [AtomicU64; 18] = [
+AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// [`RECORD`] since the last call.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_record() -> [u64; 18] {
+    let mut out = [0u64; 18];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = RECORD[i].swap(0, Ordering::Relaxed);
+    }
+    out
+}
+
+/// Times a scope into `RECORD` slot `0` (all draw calls), `1` (preparing)
+/// or `2` (binding).
+#[cfg(feature = "diagnostics")]
+struct Timed(usize, std::time::Instant);
+
+#[cfg(feature = "diagnostics")]
+impl Timed {
+    fn new(slot: usize) -> Self {
+        Timed(slot, std::time::Instant::now())
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Timed {
+    fn drop(&mut self) {
+        RECORD[self.0].fetch_add(self.1.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
 /// Marks the last traced draw as not run on the host, counts it by why
 /// (the reason [`not_run`] gave, if its pipeline has a host one) and notes
 /// it in the list (diagnostics).
@@ -457,6 +513,8 @@ impl State {
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
+        let _timed = Timed::new(1);
+        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
@@ -539,6 +597,8 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        let _timed = Timed::new(2);
         let l = &list.list;
         // A depth copy of ours (`crate::twin`) since the last one ran a
         // compute pipeline.
@@ -604,6 +664,8 @@ impl State {
         // table names: everything the bound heap's views reach is brought up
         // to date at submission (`crate::bindless`).
         if p.stages.iter().any(|s| s.translated().host.heap) {
+            #[cfg(feature = "diagnostics")]
+            let _heap = Timed::new(9);
             let writes = p.stages.iter().any(|s| s.translated().host.heap_writes);
             if let Some(title_heap) = (self.heaps[0] != 0)
                 .then(|| crate::descriptor::heap(self.heaps[0] as This))
@@ -620,7 +682,11 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
-            let made = self.tables(list, &t.used, compute);
+            let made = {
+                #[cfg(feature = "diagnostics")]
+                let _tables = Timed::new(6);
+                self.tables(list, &t.used, compute)
+            };
             // A depth copy of ours made readable a texture the tables hold
             // (`crate::twin`), with a compute pipeline: this one's again
             // (root arguments are set below).
@@ -651,6 +717,8 @@ impl State {
             // their addresses go into the page table.
             let mut roots = Vec::new();
             if let Some((param, dwords)) = stage.user_data {
+                #[cfg(feature = "diagnostics")]
+                let _values = Timed::new(7);
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
                     if u.root == RootType::Descriptor
@@ -712,6 +780,8 @@ impl State {
                     }
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            let _roots = Timed::new(8);
             for (views, kind) in [(&stage.root_cbvs, 0), (&stage.root_srvs, 1), (&stage.root_uavs, 2)] {
                 for &(slot, param) in views {
                     if kind == 1 && slot == victory_shader::emit::VIEW_STRIDES {
@@ -759,6 +829,10 @@ impl State {
                     }
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            drop(_roots);
+            #[cfg(feature = "diagnostics")]
+            let _memory = Timed::new(10);
             if let Some(param) = stage.view_addresses {
                 let gpu = (self.heaps[0] != 0)
                     .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
@@ -1000,6 +1074,10 @@ impl State {
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
+        let _timed = Timed::new(4);
+        #[cfg(feature = "diagnostics")]
+        RECORD[5].fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             dropped(list, self.pipeline, "dispatch");
@@ -1105,6 +1183,10 @@ impl State {
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
+        let _timed = Timed::new(4);
+        #[cfg(feature = "diagnostics")]
+        RECORD[5].fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
@@ -1134,6 +1216,10 @@ impl State {
     }
 
     fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+        #[cfg(feature = "diagnostics")]
+        let _entry = Timed::new(12);
+        #[cfg(feature = "diagnostics")]
+        RECORD[11].fetch_add(1, Ordering::Relaxed);
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -1144,7 +1230,14 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
+        let view = {
+            #[cfg(feature = "diagnostics")]
+            let _mirror = Timed::new(13);
+            host.mirror(index, handle, true)
+        };
+        if let Some(view) = view {
+            #[cfg(feature = "diagnostics")]
+            let _readable = Timed::new(14);
             readable(list, u, &view, true);
         }
     }
@@ -1481,6 +1574,10 @@ impl State {
         first_instance: u32,
     ) {
         #[cfg(feature = "diagnostics")]
+        let _timed = Timed::new(0);
+        #[cfg(feature = "diagnostics")]
+        RECORD[3].fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         // Rectangles: completed by the pipeline's geometry shader, else
         // expanded into vertex buffers of their own.
@@ -1593,6 +1690,10 @@ impl State {
         first_instance: u32,
     ) {
         #[cfg(feature = "diagnostics")]
+        let _timed = Timed::new(0);
+        #[cfg(feature = "diagnostics")]
+        RECORD[3].fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
         if rects {
@@ -1641,6 +1742,10 @@ impl State {
         count: Option<u64>,
     ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
+        #[cfg(feature = "diagnostics")]
+        let _timed = Timed::new(0);
+        #[cfg(feature = "diagnostics")]
+        RECORD[3].fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);

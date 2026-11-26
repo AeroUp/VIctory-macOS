@@ -2756,6 +2756,50 @@ impl Meter {
             [0, 1].map(|i| COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames);
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
+        // Of a frame, ms in the title's draw calls (diagnostics builds).
+        #[cfg(feature = "diagnostics")]
+        let [record_ms, prepare_ms, bind_ms, record_calls, dispatch_ms, dispatch_calls, tables_ms, values_ms, roots_ms, heap_ms, memory_ms, table_entries, entry_ms, mirror_ms, readable_ms, mirror_calls, mirror_hits, title_records] = {
+            let [
+                us,
+                prep,
+                bind,
+                calls,
+                disp,
+                disp_calls,
+                tables,
+                values,
+                roots,
+                heap,
+                memory,
+                entries,
+                entry,
+                mirror,
+                readable,
+                mirrors,
+                hits,
+                records,
+            ] = crate::draw::take_record();
+            [
+                us as f64 / 1e3 / frames,
+                prep as f64 / 1e3 / frames,
+                bind as f64 / 1e3 / frames,
+                calls as f64 / frames,
+                disp as f64 / 1e3 / frames,
+                disp_calls as f64 / frames,
+                tables as f64 / 1e3 / frames,
+                values as f64 / 1e3 / frames,
+                roots as f64 / 1e3 / frames,
+                heap as f64 / 1e3 / frames,
+                memory as f64 / 1e3 / frames,
+                entries as f64 / frames,
+                entry as f64 / 1e3 / frames,
+                mirror as f64 / 1e3 / frames,
+                readable as f64 / 1e3 / frames,
+                mirrors as f64 / frames,
+                hits as f64 / frames,
+                records as f64 / frames,
+            ]
+        };
         let root_views = crate::draw::take_root_view_slots() as f64 / frames;
         let null_views = crate::draw::take_null_root_views() as f64 / frames;
         // Over the same frames as the counts above.
@@ -2769,8 +2813,20 @@ impl Meter {
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame \
-                 ({null_views:.0} null views bound)",
-                making = crate::pipeline::making()
+                 ({null_views:.0} null views bound){recording}",
+                making = crate::pipeline::making(),
+                recording = {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        format!(
+                            "; {record_ms:.1} in {record_calls:.0} draw calls ({prepare_ms:.1} preparing them), {bind_ms:.1} binding (tables {tables_ms:.1}: {table_entries:.0} entries, {entry_ms:.1} in them, {mirror_ms:.1} mirroring {mirror_calls:.0} ({mirror_hits:.0} hits), {readable_ms:.1} readable; {title_records:.0} title descriptor writes; values {values_ms:.1}, roots {roots_ms:.1}, heap {heap_ms:.1}, memory {memory_ms:.1}), {dispatch_ms:.1} in {dispatch_calls:.0} dispatches"
+                        )
+                    }
+                    #[cfg(not(feature = "diagnostics"))]
+                    {
+                        String::new()
+                    }
+                }
             );
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             tracing::info!(
