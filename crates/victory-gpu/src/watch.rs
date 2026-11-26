@@ -1019,7 +1019,24 @@ pub fn writing(at: usize, len: usize) -> Writing {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     g.busy.push((first, last));
-    changed(&mut g, first, last, true);
+    if changed(&mut g, first, last, true) {
+        // Streaming buffers written repeatedly via ReadFile/DirectStorage
+        // otherwise ping-pong VirtualProtect(RO/RW) every frame.
+        for page in first..last {
+            let armed = g
+                .holders
+                .get(&page)
+                .is_some_and(|hs| hs.iter().any(|h| h.is_armed(page)));
+            if !armed {
+                let n = g.faults.entry(page).or_insert(0);
+                *n = n.saturating_add(1);
+                if *n >= 4 {
+                    g.faults.remove(&page);
+                    g.hot.insert(page, 255);
+                }
+            }
+        }
+    }
     Writing { first, last }
 }
 
