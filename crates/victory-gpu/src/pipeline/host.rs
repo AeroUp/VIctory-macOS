@@ -535,6 +535,23 @@ impl HostPipeline {
             )
         };
         if compute.is_some() {
+            // Diagnostic: `VICTORY_SKIP_COMPUTE` (comma-separated hash
+            // prefixes) drops pipelines to time what they cost.
+            if let Some((s, _)) = stages.first() {
+                static SKIP: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+                let list = SKIP.get_or_init(|| {
+                    std::env::var("VICTORY_SKIP_COMPUTE")
+                        .unwrap_or_default()
+                        .split(',')
+                        .map(|h| h.trim().to_owned())
+                        .filter(|h| !h.is_empty())
+                        .collect()
+                });
+                if list.iter().any(|h| s.hash.starts_with(h)) {
+                    tracing::warn!(hash = %s.hash, "compute pipeline skipped for timing");
+                    return None;
+                }
+            }
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
                 pRootSignature: unsafe { std::mem::transmute_copy(&root) },
