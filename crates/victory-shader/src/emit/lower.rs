@@ -6771,13 +6771,19 @@ impl<'a> Lower<'a> {
             "v_readfirstlane_b32" => {
                 // In halves the host wave's first lane is the console's only
                 // for a value the same in both halves, or where the group is
-                // one host wave.
-                if self.halves
+                // one host wave; otherwise the lower half's first lane is
+                // fetched through the scratch (the exchange's barriers need a
+                // block every thread of the group runs).
+                let across = self.halves
                     && !self.one_host_wave()
                     && matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
-                        if !inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)))
-                {
-                    return Err(halves::FIRST_ACROSS);
+                        if !inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)));
+                if across {
+                    let block = self.cur_ir;
+                    let uniform = self.across_blocks()[block];
+                    if !uniform {
+                        return Err(halves::FIRST_ACROSS);
+                    }
                 }
                 let a = s(self, 0)?;
                 // shortcut: without console lanes, the first lane of the host
@@ -6794,6 +6800,15 @@ impl<'a> Lower<'a> {
                     &[a],
                 );
                 let r = self.helper_reads_own(a, r);
+                // The console's first lane is in the lower half: the upper
+                // half takes that half's first-lane value from the exchange.
+                let r = if across {
+                    let other = self.across_exchange(r, r);
+                    let low = self.in_low_half();
+                    self.s.m.select(self.cur, low, r, other)
+                } else {
+                    r
+                };
                 int(self, r)
             }
             "v_permlane16_b32" | "v_permlanex16_b32" => {
